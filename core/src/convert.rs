@@ -2,7 +2,7 @@
 
 use crate::camf::{Camf, Value};
 use crate::exif::{self, PreviewExif};
-use crate::tiff::{self, Exif, Metadata};
+use crate::tiff::{self, Compression, Exif, Metadata};
 use crate::x3f::{Error, Properties, Raw, X3f};
 use std::io::{self, Write};
 
@@ -197,6 +197,7 @@ fn metadata(props: &Properties, camf: &Camf, preview: &PreviewExif) -> Metadata 
             .clone()
             .or_else(|| preview.datetime_original.clone()),
         orientation: preview.orientation,
+        compression: Compression::Deflate,
         exif: exif(props, camf, preview),
         xmp: Some(xmp(props, camf)),
     }
