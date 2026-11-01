@@ -46,7 +46,12 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W, mode: Mode) -> Result<(
         .preview_jpegs()
         .find_map(exif::from_jpeg)
         .unwrap_or_default();
-    let raw = x3f.decode()?;
+    let mut raw = x3f.decode()?;
+    // Raw output stays exactly what the sensor read; only the developed look hides its defects.
+    if matches!(mode, Mode::Developed(_)) {
+        develop::repair_highlight_pixels(&mut raw, &camf);
+        develop::repair_autofocus_pixels(&mut raw, &camf);
+    }
 
     let (full_width, full_height) = match &raw {
         Raw::Merrill { width, height, .. } => (*width, *height),

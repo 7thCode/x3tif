@@ -28,6 +28,172 @@ pub enum Exposure {
 /// Exposure compensation limits (EV), for both the automatic fit and explicit values.
 pub const EV_RANGE: (f64, f64) = (-4.0, 4.0);
 
+/// Quattro low-resolution layers contain a regular grid of "highlight" pixels (CAMF
+/// `HighlightPixelsInfo`: first column, first row, column pitch, row pitch) that read about half
+/// of the true value. Left alone they show up as dotted vertical lines, so, as x3f_tools does,
+/// replace each by the mean of its horizontal and vertical neighbours (the grid is sparse enough
+/// that those are always ordinary pixels).
+pub fn repair_highlight_pixels(raw: &mut Raw, camf: &Camf) {
+    let Raw::Quattro {
+        low_width,
+        low_height,
+        low,
+        ..
+    } = raw
+    else {
+        return;
+    };
+    let Some(info) = camf.matrix("HighlightPixelsInfo").filter(|m| m.len() == 4) else {
+        return;
+    };
+    let [col0, row0, col_pitch, row_pitch] =
+        [info[0], info[1], info[2], info[3]].map(|v| v as usize);
+    if col_pitch < 2 || row_pitch < 2 {
+        return;
+    }
+    let (w, h) = (*low_width, *low_height);
+    for y in (row0..h).step_by(row_pitch) {
+        for x in (col0..w).step_by(col_pitch) {
+            let mut neighbours = Vec::with_capacity(4);
+            if x > 0 {
+                neighbours.push((x - 1, y));
+            }
+            if x + 1 < w {
+                neighbours.push((x + 1, y));
+            }
+            if y > 0 {
+                neighbours.push((x, y - 1));
+            }
+            if y + 1 < h {
+                neighbours.push((x, y + 1));
+            }
+            for c in 0..3 {
+                let sum: u32 = neighbours
+                    .iter()
+                    .map(|&(nx, ny)| low[(ny * w + nx) * 3 + c] as u32)
+                    .sum();
+                let n = neighbours.len() as u32;
+                low[(y * w + x) * 3 + c] = ((sum + n / 2) / n) as u16;
+            }
+        }
+    }
+}
+
+/// Autofocus pixels of the sd Quattro (id 40) and sd Quattro H (id 41): regular grids that read low
+/// in the luma (top) and chroma (low) layers. Positions are not in the file; these are the ones
+/// x3f_tools uses (first column, last column, column pitch, width, first row, last row, row pitch,
+/// height). The sd Quattro grids were checked against a sample (pixels read 8-15% low); the
+/// sd Quattro H ones are taken from x3f_tools as they are.
+struct Grid(usize, usize, usize, usize, usize, usize, usize, usize);
+
+impl Grid {
+    fn points(&self) -> Vec<(usize, usize)> {
+        let Grid(ci, cf, cp, cs, ri, rf, rp, rs) = *self;
+        let mut out = Vec::new();
+        for row in (ri..=rf).step_by(rp) {
+            for col in (ci..=cf).step_by(cp) {
+                for r in 0..rs {
+                    for c in 0..cs {
+                        out.push((col + c, row + r));
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Replaces the given pixels of an interleaved image by the mean of their usable neighbours:
+/// all four when possible, otherwise the horizontal or the vertical pair (as x3f_tools does).
+fn interpolate_pixels(
+    data: &mut [u16],
+    width: usize,
+    height: usize,
+    channels: usize,
+    points: &[(usize, usize)],
+) {
+    let mut bad = vec![false; width * height];
+    let points: Vec<_> = points
+        .iter()
+        .copied()
+        .filter(|&(x, y)| x < width && y < height)
+        .collect();
+    for &(x, y) in &points {
+        bad[y * width + x] = true;
+    }
+    let usable = |x: isize, y: isize| {
+        (x >= 0
+            && y >= 0
+            && (x as usize) < width
+            && (y as usize) < height
+            && !bad[y as usize * width + x as usize])
+            .then_some((x as usize, y as usize))
+    };
+    let fixes: Vec<_> = points
+        .iter()
+        .map(|&(x, y)| {
+            let (xi, yi) = (x as isize, y as isize);
+            let n = [
+                usable(xi - 1, yi),
+                usable(xi + 1, yi),
+                usable(xi, yi - 1),
+                usable(xi, yi + 1),
+            ];
+            let chosen: Vec<(usize, usize)> = if n.iter().all(Option::is_some) {
+                n.iter().flatten().copied().collect()
+            } else if n[0].is_some() && n[1].is_some() {
+                vec![n[0].unwrap(), n[1].unwrap()]
+            } else if n[2].is_some() && n[3].is_some() {
+                vec![n[2].unwrap(), n[3].unwrap()]
+            } else {
+                n.iter().flatten().copied().collect()
+            };
+            (x, y, chosen)
+        })
+        .collect();
+    for (x, y, chosen) in fixes {
+        if chosen.is_empty() {
+            continue;
+        }
+        for c in 0..channels {
+            let sum: u32 = chosen
+                .iter()
+                .map(|&(nx, ny)| data[(ny * width + nx) * channels + c] as u32)
+                .sum();
+            let n = chosen.len() as u32;
+            data[(y * width + x) * channels + c] = ((sum + n / 2) / n) as u16;
+        }
+    }
+}
+
+/// Interpolates over the autofocus pixels of sd Quattro / sd Quattro H files.
+pub fn repair_autofocus_pixels(raw: &mut Raw, camf: &Camf) {
+    let Raw::Quattro {
+        low_width,
+        low_height,
+        low,
+        top_width,
+        top_height,
+        top,
+    } = raw
+    else {
+        return;
+    };
+    let (luma, chroma) = match camf.number("CAMERAID").map(|v| v as u32) {
+        Some(40) => (
+            Grid(217, 5641, 16, 1, 464, 3312, 32, 2),
+            Grid(108, 2820, 8, 1, 232, 1656, 16, 1),
+        ),
+        Some(41) => (
+            Grid(233, 6425, 16, 1, 592, 3888, 32, 2),
+            Grid(116, 2820, 8, 1, 296, 1944, 16, 1),
+        ),
+        _ => return,
+    };
+    interpolate_pixels(top, *top_width, *top_height, 1, &luma.points());
+    interpolate_pixels(low, *low_width, *low_height, 3, &chroma.points());
+}
+
 /// Sensor bit depth from CAMF (`ImageDepth`); 14 bit is what Quattro and 12 bit what Merrill report.
 fn image_depth(camf: &Camf) -> Option<u32> {
     camf.number("ImageDepth")
@@ -97,6 +263,46 @@ fn wb_from_code(code: u32) -> &'static str {
     }
 }
 
+/// Photo Pro renders Merrill files with a red gain about 4.5% above the file's white balance
+/// gain (fitted against its TIFF output; the camera JPEGs of four more files agree within
+/// 1.038-1.044). Quattro needs no such trim (0.8%).
+const MERRILL_RED_TRIM: f64 = 1.04;
+
+/// The table's gains are relative to a green gain of about 0.855, while the per-white-balance
+/// `WBGain` entries are relative to 1. Found by comparing with those entries (about 1.16) and then
+/// tuned: red against the camera's own JPEG (neutral areas of dp0 Quattro shots within 3%; 1.0
+/// would be off by 50%), blue against Photo Pro's TIFF output. Four dp0 Quattro files (all at
+/// 5000K) agreed on red 1.18-1.20 and blue 1.10-1.12; a single 1.17 left blue 6-13/255 too high.
+const COLOR_TEMP_RED_SCALE: f64 = 1.18;
+const COLOR_TEMP_BLUE_SCALE: f64 = 1.12;
+
+/// White balance by colour temperature (Quattro "ColorTemp" setting): the gains and colour
+/// matrix are interpolated from `ColorTempTableInfo` at the file's `ColorTempValue`. The table has
+/// one row per temperature: kelvin, blue gain, red gain, then the 3x3 colour matrix.
+fn color_temp_calibration(camf: &Camf) -> Option<(f64, [f64; 3], [f64; 9])> {
+    let kelvin = camf.number("ColorTempValue")?;
+    let table = camf.matrix("ColorTempTableInfo")?;
+    let rows: Vec<&[f64]> = table.chunks_exact(12).collect();
+    let (first, last) = (rows.first()?, rows.last()?);
+    let row: [f64; 12] = if kelvin <= first[0] {
+        (*first).try_into().ok()?
+    } else if kelvin >= last[0] {
+        (*last).try_into().ok()?
+    } else {
+        let i = rows.windows(2).position(|w| kelvin <= w[1][0])?;
+        let (a, b) = (rows[i], rows[i + 1]);
+        let t = (kelvin - a[0]) / (b[0] - a[0]);
+        std::array::from_fn(|c| a[c] + (b[c] - a[c]) * t)
+    };
+    let gain = [
+        row[2] * COLOR_TEMP_RED_SCALE,
+        1.0,
+        row[1] * COLOR_TEMP_BLUE_SCALE,
+    ];
+    let cc: [f64; 9] = std::array::from_fn(|c| row[3 + c]);
+    Some((kelvin, gain, cc))
+}
+
 impl Developer {
     /// `header_wb` is the white balance name from the X3F header (older files only).
     pub fn new(raw: &Raw, camf: &Camf, header_wb: Option<&str>) -> Result<Developer, Error> {
@@ -109,19 +315,28 @@ impl Developer {
             Some(code) => wb_from_code(code as u32).to_owned(),
             None => header_wb.unwrap_or("Auto").to_owned(),
         };
-        let (name, gain, cc) = [canonical_wb(&wanted), "Auto", "Sunlight"]
+        let color_temp = (wanted == "ColorTemp")
+            .then(|| color_temp_calibration(camf))
+            .flatten();
+        let (name, gain, cc) = color_temp
+            .map(|(k, gain, cc)| (format!("ColorTemp {k:.0}K"), gain.to_vec(), cc.to_vec()))
             .into_iter()
-            .find_map(|wb| {
-                let gain = camf
-                    .property("WhiteBalanceGains", wb)
-                    .and_then(|m| camf.matrix(m))
-                    .filter(|m| m.len() == 3)?;
-                let cc = camf
-                    .property("WhiteBalanceColorCorrections", wb)
-                    .and_then(|m| camf.matrix(m))
-                    .filter(|m| m.len() == 9)?;
-                Some((wb.to_owned(), gain.to_vec(), cc.to_vec()))
-            })
+            .chain(
+                [canonical_wb(&wanted), "Auto", "Sunlight"]
+                    .into_iter()
+                    .find_map(|wb| {
+                        let gain = camf
+                            .property("WhiteBalanceGains", wb)
+                            .and_then(|m| camf.matrix(m))
+                            .filter(|m| m.len() == 3)?;
+                        let cc = camf
+                            .property("WhiteBalanceColorCorrections", wb)
+                            .and_then(|m| camf.matrix(m))
+                            .filter(|m| m.len() == 9)?;
+                        Some((wb.to_owned(), gain.to_vec(), cc.to_vec()))
+                    }),
+            )
+            .next()
             .ok_or(Error::MissingCalibration(
                 "WhiteBalanceGains / WhiteBalanceColorCorrections",
             ))?;
@@ -137,6 +352,9 @@ impl Developer {
                     *g *= f;
                 }
             }
+        }
+        if matches!(raw, Raw::Merrill { .. }) {
+            gain[0] *= MERRILL_RED_TRIM;
         }
         let iso = match (camf.number("CaptureISO"), camf.number("SensorISO")) {
             (Some(c), Some(s)) if s > 0.0 => c / s,
@@ -459,12 +677,15 @@ mod tests {
     #[test]
     fn white_balance_gain_scales_red_before_the_curve() {
         let d = Developer::new(&raw(), &camf(1.0), None).unwrap();
-        // Normalised input 0.1 on every channel; red gain 2 -> 0.2 linear, others 0.1.
+        // Normalised input 0.1 on every channel; red gain 2 (times the Merrill trim) -> 0.2 linear, others 0.1.
         let v = 100.0 + 0.1 * (4095.0 - 100.0);
         let mut row = [v as u16; 3];
         d.apply(&mut row);
         let enc = |l: f64| (encode(l) * 65535.0).round();
-        assert!((row[0] as f64 - enc(0.2)).abs() < 40.0, "{row:?}");
+        assert!(
+            (row[0] as f64 - enc(0.2 * MERRILL_RED_TRIM)).abs() < 40.0,
+            "{row:?}"
+        );
         assert!((row[1] as f64 - enc(0.1)).abs() < 40.0, "{row:?}");
     }
 
@@ -503,6 +724,104 @@ mod tests {
         assert_eq!(encode(0.0), 0.0);
         assert!((encode(1.0) - 1.0).abs() < 1e-12);
         assert!(encode(0.3) < srgb_encode(0.3) || encode(0.9) > srgb_encode(0.9));
+    }
+
+    fn color_temp_camf(kelvin: f64) -> Camf {
+        let mut c = camf(11.0);
+        c.0.push(m("ColorTempValue", &[kelvin]));
+        c.0.push(Entry {
+            name: "ColorTempTableInfo".into(),
+            value: Value::Matrix {
+                dims: vec![2, 12],
+                values: vec![
+                    // kelvin, blue gain, red gain, colour matrix (rows sum to 1)
+                    4000.0, 1.0, 0.8, 3.0, -3.0, 1.0, -2.0, 4.0, -1.0, 0.6, -4.6, 5.0, //
+                    6000.0, 0.8, 1.0, 3.0, -3.0, 1.0, -2.0, 4.0, -1.0, 0.6, -4.6, 5.0,
+                ],
+            },
+        });
+        c
+    }
+
+    #[test]
+    fn highlight_pixels_are_replaced_by_their_neighbours() {
+        // 4x4 low layer, all 100 except the grid pixel at (1, 1) which reads half.
+        let quattro = || {
+            let mut low = vec![100u16; 4 * 4 * 3];
+            for c in 0..3 {
+                low[(4 + 1) * 3 + c] = 50;
+            }
+            Raw::Quattro {
+                low_width: 4,
+                low_height: 4,
+                low,
+                top_width: 8,
+                top_height: 8,
+                top: vec![0; 64],
+            }
+        };
+        let pixel = |raw: &Raw| match raw {
+            Raw::Quattro { low, .. } => low[(4 + 1) * 3],
+            _ => unreachable!(),
+        };
+        let mut raw = quattro();
+        repair_highlight_pixels(
+            &mut raw,
+            &Camf(vec![m("HighlightPixelsInfo", &[1.0, 1.0, 2.0, 2.0])]),
+        );
+        assert_eq!(pixel(&raw), 100);
+        // Files without the entry are left alone.
+        let mut untouched = quattro();
+        repair_highlight_pixels(&mut untouched, &Camf::default());
+        assert_eq!(pixel(&untouched), 50);
+    }
+
+    #[test]
+    fn autofocus_grid_pixels_are_interpolated_for_sd_quattro_only() {
+        let quattro = || Raw::Quattro {
+            low_width: 4,
+            low_height: 4,
+            low: vec![100; 4 * 4 * 3],
+            top_width: 8,
+            top_height: 8,
+            top: vec![100; 64],
+        };
+        // The real grids sit far outside this tiny image, so check the interpolation directly.
+        let mut data = vec![100u16; 6 * 6];
+        data[2 * 6 + 2] = 40;
+        data[2 * 6 + 3] = 40; // two vertically-adjacent-free neighbours (horizontal pair of bad pixels)
+        interpolate_pixels(&mut data, 6, 6, 1, &[(2, 2), (3, 2)]);
+        assert_eq!((data[2 * 6 + 2], data[2 * 6 + 3]), (100, 100));
+        // Other cameras are left alone.
+        let mut raw = quattro();
+        repair_autofocus_pixels(&mut raw, &Camf(vec![m("CAMERAID", &[83.0])]));
+        let Raw::Quattro { top, .. } = &raw else {
+            unreachable!()
+        };
+        assert!(top.iter().all(|&v| v == 100));
+    }
+
+    #[test]
+    fn color_temp_interpolates_the_table() {
+        let (k, gain, cc) = color_temp_calibration(&color_temp_camf(5000.0)).unwrap();
+        assert_eq!(k, 5000.0);
+        // Halfway: red 0.9, blue 0.9, each scaled to the WBGain convention; green stays 1.
+        assert!((gain[0] - 0.9 * COLOR_TEMP_RED_SCALE).abs() < 1e-9);
+        assert!((gain[2] - 0.9 * COLOR_TEMP_BLUE_SCALE).abs() < 1e-9);
+        assert_eq!(gain[1], 1.0);
+        assert_eq!(&cc[..3], &[3.0, -3.0, 1.0]);
+        // Outside the table the nearest row is used.
+        let (_, low, _) = color_temp_calibration(&color_temp_camf(1000.0)).unwrap();
+        assert!((low[0] - 0.8 * COLOR_TEMP_RED_SCALE).abs() < 1e-9);
+    }
+
+    #[test]
+    fn color_temp_setting_uses_the_table_instead_of_auto() {
+        let d = Developer::new(&raw(), &color_temp_camf(5000.0), None).unwrap();
+        assert_eq!(d.white_balance, "ColorTemp 5000K");
+        // Without the table it falls back to Auto as before.
+        let d = Developer::new(&raw(), &camf(11.0), None).unwrap();
+        assert_eq!(d.white_balance, "Auto");
     }
 
     #[test]
