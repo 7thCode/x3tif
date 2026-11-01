@@ -3,174 +3,501 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>x3tif</title>
+    <title>x3tif — Foveon の素のデータを、そのまま TIFF に</title>
+    <meta
+      name="description"
+      content="Sigma Foveon の X3F(dp Merrill / dp Quattro / sd Quattro)を、現像せずに 16bit TIFF へ変換するデスクトップアプリ。ドロップするだけ。"
+    />
+    <meta name="color-scheme" content="dark" />
     <style>
       :root {
-        --bg: #ffffff;
-        --bg-alt: #f5f5f7;
-        --border: #d9d9df;
-        --text: #1b1b1f;
-        --text-muted: #6b6b76;
-        --accent: #2f6fed;
-        color-scheme: light dark;
-      }
-      @media (prefers-color-scheme: dark) {
-        :root {
-          --bg: #1b1b1f;
-          --bg-alt: #242429;
-          --border: #35353c;
-          --text: #f0f0f2;
-          --text-muted: #9a9aa5;
-          --accent: #5b8dfd;
-        }
+        --bg: #0c0c0d;
+        --bg-raised: #151517;
+        --line: #26262a;
+        --text: #ebe8e2;
+        --muted: #8f8d88;
+        --amber: #e3a857;
+        --layer-b: #4f8cff;
+        --layer-g: #4fc27a;
+        --layer-r: #ff5a4f;
+        color-scheme: dark;
       }
       * {
         box-sizing: border-box;
+      }
+      html {
+        scroll-behavior: smooth;
       }
       body {
         margin: 0;
         background: var(--bg);
         color: var(--text);
         font-family:
-          -apple-system,
-          BlinkMacSystemFont,
-          'Segoe UI',
-          Roboto,
-          sans-serif;
-        line-height: 1.6;
+          -apple-system, BlinkMacSystemFont, 'Hiragino Sans', 'Yu Gothic', 'Segoe UI', Roboto, sans-serif;
+        line-height: 1.75;
+        -webkit-font-smoothing: antialiased;
+        word-break: auto-phrase; /* break Japanese at phrase boundaries where supported */
       }
-      main {
-        max-width: 720px;
+      a {
+        color: var(--amber);
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.88em;
+        background: #1d1d20;
+        padding: 2px 6px;
+        border-radius: 4px;
+      }
+      .wrap {
+        max-width: 980px;
         margin: 0 auto;
-        padding: 48px 20px 80px;
+        padding: 0 24px;
+      }
+      section {
+        padding: 72px 0;
+        border-top: 1px solid var(--line);
+      }
+      h2 {
+        font-size: 13px;
+        letter-spacing: 0.22em;
+        text-transform: uppercase;
+        color: var(--amber);
+        font-weight: 600;
+        margin: 0 0 12px;
+      }
+      h3 {
+        font-size: 24px;
+        font-weight: 600;
+        line-height: 1.4;
+        margin: 0 0 20px;
+        letter-spacing: 0.01em;
+        text-wrap: balance;
+      }
+      p {
+        margin: 0 0 16px;
+      }
+      .muted {
+        color: var(--muted);
+      }
+
+      /* Hero */
+      .hero {
+        border-top: 0;
+        padding: 88px 0 72px;
+        display: grid;
+        grid-template-columns: minmax(0, 1.3fr) minmax(0, 0.7fr);
+        gap: 48px;
+        align-items: center;
+      }
+      .wordmark {
+        font-size: 15px;
+        letter-spacing: 0.3em;
+        color: var(--muted);
+        margin-bottom: 28px;
+      }
+      .wordmark b {
+        color: var(--text);
       }
       h1 {
-        font-size: 28px;
-        margin-bottom: 4px;
+        font-size: clamp(26px, 3.9vw, 42px);
+        line-height: 1.25;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+        margin: 0 0 24px;
       }
-      .subtitle {
-        color: var(--text-muted);
-        margin-top: 0;
+      h1 em {
+        font-style: normal;
+        color: var(--amber);
+        white-space: nowrap;
+      }
+      .lead {
+        color: #c9c6bf;
+        max-width: 30em;
         margin-bottom: 32px;
       }
-      .download-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-        gap: 16px;
-        margin-bottom: 16px;
+      .cta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
       }
-      .download-card {
-        border: 1px solid var(--border);
+      .btn {
+        display: inline-block;
+        padding: 13px 22px;
+        border-radius: 999px;
+        background: var(--amber);
+        color: #1a1306;
+        font-weight: 700;
+        text-decoration: none;
+        font-size: 15px;
+      }
+      .btn.ghost {
+        background: transparent;
+        color: var(--text);
+        border: 1px solid #3a3a40;
+        font-weight: 500;
+      }
+      .btn:hover {
+        filter: brightness(1.08);
+      }
+      .cta small {
+        color: var(--muted);
+        width: 100%;
+        font-size: 13px;
+      }
+
+      /* Foveon layer stack */
+      .stack {
+        position: relative;
+        height: 300px;
+        perspective: 900px;
+      }
+      .layer {
+        position: absolute;
+        left: 8%;
+        right: 8%;
+        height: 92px;
+        border-radius: 10px;
+        transform: rotateX(58deg) rotateZ(-18deg);
+        transform-origin: center;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        display: flex;
+        align-items: center;
+        padding-left: 18px;
+        font-size: 12px;
+        letter-spacing: 0.18em;
+        color: rgba(255, 255, 255, 0.85);
+        font-weight: 600;
+        box-shadow: 0 24px 40px rgba(0, 0, 0, 0.45);
+      }
+      .layer span {
+        transform: rotateZ(0deg);
+      }
+      .l-b {
+        top: 8px;
+        background: linear-gradient(135deg, rgba(79, 140, 255, 0.78), rgba(79, 140, 255, 0.3));
+      }
+      .l-g {
+        top: 88px;
+        background: linear-gradient(135deg, rgba(79, 194, 122, 0.78), rgba(79, 194, 122, 0.3));
+      }
+      .l-r {
+        top: 168px;
+        background: linear-gradient(135deg, rgba(255, 90, 79, 0.78), rgba(255, 90, 79, 0.3));
+      }
+      .stack-caption {
+        text-align: center;
+        font-size: 12px;
+        color: var(--muted);
+        letter-spacing: 0.14em;
+        margin-top: 24px;
+      }
+
+      /* Feature grid */
+      .grid3 {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        gap: 20px;
+        margin-top: 36px;
+      }
+      .card {
+        background: var(--bg-raised);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 26px;
+      }
+      .card h4 {
+        margin: 0 0 10px;
+        font-size: 17px;
+        font-weight: 600;
+      }
+      .card p {
+        margin: 0;
+        color: #b9b6af;
+        font-size: 15px;
+      }
+
+      /* Flow */
+      .flow {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 10px 14px;
+        margin-top: 32px;
+      }
+      .chip {
+        border: 1px solid #34343a;
+        border-radius: 999px;
+        padding: 8px 18px;
+        font-size: 14px;
+        background: var(--bg-raised);
+      }
+      .chip.hi {
+        border-color: var(--amber);
+        color: var(--amber);
+      }
+      .arrow {
+        color: var(--muted);
+      }
+
+      /* Spec list */
+      dl.spec {
+        display: grid;
+        grid-template-columns: 11em 1fr;
+        margin: 28px 0 0;
+        border-top: 1px solid var(--line);
+      }
+      dl.spec dt,
+      dl.spec dd {
+        margin: 0;
+        padding: 14px 0;
+        border-bottom: 1px solid var(--line);
+        font-size: 15px;
+      }
+      dl.spec dt {
+        color: var(--muted);
+      }
+
+      details {
+        margin-top: 28px;
+        border: 1px solid var(--line);
         border-radius: 12px;
-        padding: 24px;
-        background: var(--bg-alt);
+        background: var(--bg-raised);
+        padding: 0 22px;
+      }
+      summary {
+        cursor: pointer;
+        padding: 16px 0;
+        font-weight: 600;
+        font-size: 15px;
+      }
+      details p {
+        font-size: 15px;
+        color: #b9b6af;
+      }
+
+      /* Downloads */
+      .dl {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+        gap: 18px;
+        margin-top: 32px;
+      }
+      .dl .card {
         display: flex;
         flex-direction: column;
       }
-      .download-card strong {
-        display: block;
-        margin-bottom: 4px;
+      .dl .card.me {
+        border-color: var(--amber);
+        box-shadow: 0 0 0 1px var(--amber) inset;
       }
-      .download-card .platform-sub {
-        font-size: 13px;
-        color: var(--text-muted);
-        margin-bottom: 12px;
-      }
-      .download-button {
-        display: inline-block;
-        background: var(--accent);
-        color: #fff;
-        text-decoration: none;
-        padding: 12px 20px;
-        border-radius: 8px;
-        font-weight: 600;
-        text-align: center;
-        margin-top: auto;
-      }
-      .meta {
-        font-size: 13px;
-        color: var(--text-muted);
-        margin-top: 20px;
-      }
-      h2 {
+      .dl .os {
         font-size: 18px;
-        margin-top: 40px;
+        font-weight: 600;
+        margin-bottom: 2px;
       }
-      ul {
-        padding-left: 20px;
-      }
-      code {
-        background: var(--bg-alt);
-        padding: 2px 6px;
-        border-radius: 4px;
-        font-size: 0.9em;
-      }
-      footer {
-        margin-top: 48px;
+      .dl .sub {
         font-size: 13px;
-        color: var(--text-muted);
+        color: var(--muted);
+        margin-bottom: 18px;
       }
-      a {
-        color: var(--accent);
+      .dl .btn {
+        margin-top: auto;
+        text-align: center;
+      }
+      .note {
+        margin-top: 28px;
+        font-size: 14px;
+        color: var(--muted);
+      }
+
+      footer {
+        border-top: 1px solid var(--line);
+        padding: 40px 0 72px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      footer a {
+        color: var(--muted);
+      }
+
+      @media (max-width: 760px) {
+        .hero {
+          grid-template-columns: minmax(0, 1fr);
+          padding-top: 56px;
+        }
+        .stack {
+          height: 280px;
+        }
+        dl.spec {
+          grid-template-columns: 1fr;
+        }
+        dl.spec dt {
+          border-bottom: 0;
+          padding-bottom: 0;
+        }
       }
     </style>
   </head>
   <body>
-    <main>
-      <h1>x3tif</h1>
-      <p class="subtitle">Sigma Foveon の X3F を、現像せずに 16bit TIFF へ変換するデスクトップアプリ。ファイルをドロップするだけ。</p>
-
-      <p><strong>最新版: v0.1.0</strong></p>
-      <div class="download-grid">
-        <div class="download-card">
-          <strong>macOS</strong>
-          <span class="platform-sub">Universal(Apple Silicon / Intel)</span>
-          <a
-            class="download-button"
-            href="https://github.com/7thCode/x3tif/releases/download/v0.1.0/x3tif_0.1.0_universal.dmg"
-          >
-            .dmg をダウンロード
-          </a>
+    <div class="wrap">
+      <div class="hero">
+        <div>
+          <div class="wordmark"><b>x3tif</b> &nbsp;·&nbsp; X3F → TIFF</div>
+          <h1><span style="white-space: nowrap">Foveon の<em>素のデータ</em>を、</span><br /><span style="white-space: nowrap">そのまま持ち出す。</span></h1>
+          <p class="lead">
+            Sigma の RAW(X3F)を、現像せずに 16bit の TIFF へ。ホワイトバランスも、色変換も、ガンマも、まだ何もかけません。
+            お気に入りの現像ソフトで、一から仕上げるための入り口です。
+          </p>
+          <div class="cta">
+            <a class="btn" href="#download">ダウンロード</a>
+            <a class="btn ghost" href="https://github.com/7thCode/x3tif">GitHub</a>
+            <small>macOS / Windows / Linux ・ 無料 ・ MIT License</small>
+          </div>
         </div>
-        <div class="download-card">
-          <strong>Windows</strong>
-          <span class="platform-sub">64bit (x64)</span>
-          <a
-            class="download-button"
-            href="https://github.com/7thCode/x3tif/releases/download/v0.1.0/x3tif_0.1.0_x64-setup.exe"
-          >
-            .exe をダウンロード
-          </a>
-        </div>
-        <div class="download-card">
-          <strong>Linux</strong>
-          <span class="platform-sub">AppImage / 64bit (x64)</span>
-          <a
-            class="download-button"
-            href="https://github.com/7thCode/x3tif/releases/download/v0.1.0/x3tif_0.1.0_amd64.AppImage"
-          >
-            .AppImage をダウンロード
-          </a>
+        <div>
+          <div class="stack" aria-hidden="true">
+            <div class="layer l-b"><span>TOP · B</span></div>
+            <div class="layer l-g"><span>MIDDLE · G</span></div>
+            <div class="layer l-r"><span>BOTTOM · R</span></div>
+          </div>
+          <div class="stack-caption">1 画素に 3 層。補間のない色情報をそのまま。</div>
         </div>
       </div>
-      <p class="meta">
-        過去のリリース一覧は <a href="https://github.com/7thCode/x3tif/releases">Releases</a> から確認できます。
-      </p>
+    </div>
 
-      <h2>主な機能</h2>
-      <ul>
-        <li>対応機種: dp Merrill / dp Quattro / sd Quattro(H)</li>
-        <li>センサー値をそのまま 16bit リニア RGB の TIFF に保存(WB・色変換・ガンマなし)</li>
-        <li>機種名・撮影日時・向き・EXIF と、WB ゲイン・色マトリクスなどの校正値(XMP)を埋め込み</li>
-        <li>X3F をウィンドウにドロップすると、同じフォルダに <code>.tif</code> を作成(既存ファイルは上書きしません)</li>
-      </ul>
+    <section>
+      <div class="wrap">
+        <h2>Why</h2>
+        <h3>現像の前の、いちばん素直な状態を残す。</h3>
+        <p class="muted" style="max-width: 36em">
+          Foveon センサーは、1 画素の中に 3 層の受光層を重ねています。ベイヤー配列のような色の補間(デモザイク)がありません。
+          x3tif は、そのセンサーの値に手を加えず、広く読める TIFF に収めます。
+        </p>
+        <div class="grid3">
+          <div class="card">
+            <h4>センサー値をそのまま</h4>
+            <p>
+              16bit・3 チャンネルのリニア RGB。黒レベルの引き算も、ホワイトバランスも、トーンカーブも適用しません。
+              暗部のノイズフロアまで残ります。
+            </p>
+          </div>
+          <div class="card">
+            <h4>校正値も一緒に</h4>
+            <p>
+              WB ゲイン、色マトリクス、有効領域などのカメラ内の値は XMP に保存します。機種名、撮影日時、向き、絞り・露出時間・ISO などは
+              EXIF に入ります。
+            </p>
+          </div>
+          <div class="card">
+            <h4>ドロップするだけ</h4>
+            <p>
+              X3F をウィンドウに放り込むと、同じフォルダに <code>.tif</code> ができます。既存のファイルは上書きしません。
+              設定項目はありません。
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
 
-      <h2>ソースコード</h2>
-      <p>
-        <a href="https://github.com/7thCode/x3tif">github.com/7thCode/x3tif</a>
-      </p>
+    <section>
+      <div class="wrap">
+        <h2>Workflow</h2>
+        <h3>いつもの現像ソフトに、橋をかける。</h3>
+        <div class="flow">
+          <span class="chip">X3F</span><span class="arrow">→</span>
+          <span class="chip hi">x3tif</span><span class="arrow">→</span>
+          <span class="chip">16bit TIFF</span><span class="arrow">→</span>
+          <span class="chip">Lightroom / Capture One / darktable など</span>
+        </div>
+        <p class="muted" style="margin-top: 24px; max-width: 38em">
+          TIFF は一般的な形式なので、Sigma 純正以外のソフトや、複数の現像ソフトを使い分ける環境にも持ち込めます。
+          現像の判断は、すべて受け取った側に残ります。
+        </p>
+      </div>
+    </section>
 
-      <footer>X3F のデコードは x3f_tools(BSD スタイルライセンス)を参照して実装しています。</footer>
-    </main>
+    <section>
+      <div class="wrap">
+        <h2>Cameras &amp; Output</h2>
+        <h3>対応機種と、出力の中身。</h3>
+        <div class="flow" style="margin-top: 0">
+          <span class="chip">dp Merrill(dp1 / dp2 / dp3)</span>
+          <span class="chip">dp Quattro(dp0 / dp1 / dp2 / dp3)</span>
+          <span class="chip">sd Quattro / sd Quattro H</span>
+        </div>
+        <dl class="spec">
+          <dt>画像</dt>
+          <dd>16bit ・ 3 チャンネル ・ リニア RGB ・ 非圧縮 TIFF</dd>
+          <dt>処理</dt>
+          <dd>なし(黒レベル・WB・色変換・ガンマは未適用)</dd>
+          <dt>メタデータ</dt>
+          <dd>機種名 / 撮影日時 / 向き / EXIF(絞り・露出時間・ISO・露出補正・焦点距離) / XMP(PROP と CAMF の校正値)</dd>
+          <dt>対象外</dt>
+          <dd>SD9 〜 SD15、SD1 などの旧世代</dd>
+        </dl>
+        <details>
+          <summary>Quattro の画像について</summary>
+          <p>
+            Quattro は、上層がフル解像度で、中層・下層は縦横 1/2 の解像度です。出力は上層の解像度に合わせ、中層・下層を双一次補間で
+            2 倍に拡大しています。補間によって元の情報が増えるわけではありません。
+          </p>
+          <p>また、出力は下層が覆う範囲に切り出すため、上層の右端にある余分な列は含まれません。</p>
+        </details>
+      </div>
+    </section>
+
+    <section id="download">
+      <div class="wrap">
+        <h2>Download</h2>
+        <h3>v0.1.0</h3>
+        <div class="dl">
+          <div class="card" data-os="mac">
+            <div class="os">macOS</div>
+            <div class="sub">Universal(Apple Silicon / Intel) ・ 2.5 MB</div>
+            <a class="btn" href="https://github.com/7thCode/x3tif/releases/download/v0.1.0/x3tif_0.1.0_universal.dmg">.dmg</a>
+          </div>
+          <div class="card" data-os="win">
+            <div class="os">Windows</div>
+            <div class="sub">64bit(x64) ・ 1.0 MB</div>
+            <a class="btn" href="https://github.com/7thCode/x3tif/releases/download/v0.1.0/x3tif_0.1.0_x64-setup.exe">.exe</a>
+          </div>
+          <div class="card" data-os="linux">
+            <div class="os">Linux</div>
+            <div class="sub">64bit(x64) ・ AppImage 85 MB / deb 1.3 MB</div>
+            <a class="btn" href="https://github.com/7thCode/x3tif/releases/download/v0.1.0/x3tif_0.1.0_amd64.AppImage">.AppImage</a>
+          </div>
+        </div>
+        <p class="note">
+          インストーラは署名されていません。macOS で開けない場合は、右クリックから「開く」を選ぶか、
+          <code>xattr -dr com.apple.quarantine /Applications/x3tif.app</code> を実行してください。
+          Linux の deb は <a href="https://github.com/7thCode/x3tif/releases/tag/v0.1.0">Releases</a> から入手できます。
+        </p>
+      </div>
+    </section>
+
+    <footer>
+      <div class="wrap">
+        <p>
+          <a href="https://github.com/7thCode/x3tif">GitHub</a> ・
+          <a href="https://github.com/7thCode/x3tif/releases">Releases</a> ・ MIT License
+        </p>
+        <p>
+          X3F のデコードは、Roland Karlsson 氏らの
+          <a href="https://github.com/Kalpanika/x3f">x3f_tools</a>(BSD スタイルライセンス)を参照して実装しています。
+          Sigma および Foveon は各社の商標です。x3tif は Sigma とは関係のない非公式のツールです。
+        </p>
+      </div>
+    </footer>
+
+    <script>
+      // Highlight the download card that matches the visitor's OS.
+      (function () {
+        var ua = navigator.userAgent;
+        var os = /Mac/.test(ua) ? 'mac' : /Win/.test(ua) ? 'win' : /Linux|X11/.test(ua) ? 'linux' : '';
+        var card = os && document.querySelector('.dl .card[data-os="' + os + '"]');
+        if (card) card.classList.add('me');
+      })();
+    </script>
   </body>
 </html>
