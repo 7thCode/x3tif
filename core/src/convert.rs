@@ -1,6 +1,7 @@
-//! X3F → 16 bit TIFF conversion (raw sensor values, no development).
+//! X3F → 16 bit TIFF conversion, either as raw sensor values or developed to sRGB.
 
 use crate::camf::{Camf, Value};
+use crate::develop::{self, Developer, Mode};
 use crate::exif::{self, PreviewExif};
 use crate::tiff::{self, Compression, Exif, Metadata};
 use crate::x3f::{Error, Properties, Raw, X3f};
@@ -36,7 +37,7 @@ impl From<io::Error> for ConvertError {
 }
 
 /// Converts an X3F file image (bytes) into a TIFF written to `out`.
-pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W) -> Result<(), ConvertError> {
+pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W, mode: Mode) -> Result<(), ConvertError> {
     let x3f = X3f::parse(data)?;
     let props = x3f.properties()?;
     // Metadata is best effort: an unreadable CAMF must not block the conversion.
@@ -45,11 +46,39 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W) -> Result<(), ConvertEr
         .preview_jpegs()
         .find_map(exif::from_jpeg)
         .unwrap_or_default();
-    let meta = metadata(&props, &camf, &preview);
-    match x3f.decode()? {
+    let raw = x3f.decode()?;
+
+    // Per-row finishing step: shift to the 16 bit range (raw) or develop to sRGB.
+    let developer = match mode {
+        Mode::Developed => Some(Developer::new(
+            &raw,
+            &camf,
+            x3f.header_white_balance().as_deref(),
+        )?),
+        Mode::Raw => None,
+    };
+    let shift = develop::raw_shift(&camf);
+    let finish = |row: &mut [u16]| match &developer {
+        Some(d) => d.apply(row),
+        None => {
+            if shift > 0 {
+                for v in row {
+                    *v = (u32::from(*v) << shift).min(u32::from(u16::MAX)) as u16;
+                }
+            }
+        }
+    };
+
+    let output = match (&developer, shift) {
+        (Some(d), _) => Output::Developed(d.white_balance.clone()),
+        (None, s) => Output::Raw(1 << s),
+    };
+    let meta = metadata(&props, &camf, &preview, &output);
+    match raw {
         Raw::Merrill { width, height, rgb } => {
             tiff::write_rgb16(out, width, height, &meta, |y, row| {
                 row.copy_from_slice(&rgb[y * width * 3..(y + 1) * width * 3]);
+                finish(row);
             })?;
         }
         Raw::Quattro {
@@ -79,10 +108,19 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W) -> Result<(), ConvertEr
                     }
                     px[2] = top[y * top_width + x];
                 }
+                finish(row);
             })?;
         }
     }
     Ok(())
+}
+
+/// How the pixel values were produced; recorded in the XMP so later tools can undo the scaling.
+enum Output {
+    /// Raw sensor values multiplied by this factor.
+    Raw(u32),
+    /// Developed with the named white balance.
+    Developed(String),
 }
 
 /// For each full-resolution coordinate, the two neighbouring low-resolution samples and the
@@ -179,7 +217,7 @@ fn exif(props: &Properties, camf: &Camf, preview: &PreviewExif) -> Exif {
     }
 }
 
-fn metadata(props: &Properties, camf: &Camf, preview: &PreviewExif) -> Metadata {
+fn metadata(props: &Properties, camf: &Camf, preview: &PreviewExif, output: &Output) -> Metadata {
     let model = props
         .get("CAMMODEL")
         .map(|m| m.trim_start_matches("SIGMA ").to_owned())
@@ -199,7 +237,7 @@ fn metadata(props: &Properties, camf: &Camf, preview: &PreviewExif) -> Metadata 
         orientation: preview.orientation,
         compression: Compression::Deflate,
         exif: exif(props, camf, preview),
-        xmp: Some(xmp(props, camf)),
+        xmp: Some(xmp(props, camf, output)),
     }
 }
 
@@ -229,12 +267,21 @@ fn number(v: f64) -> String {
 /// X3F PROP and CAMF entries under an `x3f:` namespace (white balance gains, colour matrices,
 /// image areas, raw offset, ...) so the calibration data travels with the pixels. Large
 /// per-pixel tables are left out.
-fn xmp(props: &Properties, camf: &Camf) -> Vec<u8> {
-    let mut s = String::from(
+fn xmp(props: &Properties, camf: &Camf, output: &Output) -> Vec<u8> {
+    let how = match output {
+        // Divide the samples by RawScale to get the sensor's own values back.
+        Output::Raw(scale) => format!("x3f:OutputMode=\"raw\" x3f:RawScale=\"{scale}\""),
+        Output::Developed(wb) => format!(
+            "x3f:OutputMode=\"developed\" x3f:ColorSpace=\"sRGB\" x3f:WhiteBalance=\"{}\"",
+            xml_escape(wb)
+        ),
+    };
+    let mut s = format!(
         "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
          <x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n\
-         <rdf:Description rdf:about=\"\" xmlns:x3f=\"https://github.com/7thCode/x3tif/ns/1.0/\">\n\
+         <rdf:Description rdf:about=\"\" xmlns:x3f=\"https://github.com/7thCode/x3tif/ns/1.0/\" {}>\n\
          <x3f:Properties><rdf:Bag>\n",
+        how
     );
     for (k, v) in &props.0 {
         s.push_str(&format!(
@@ -261,7 +308,7 @@ fn xmp(props: &Properties, camf: &Camf) -> Vec<u8> {
                     vals.join(" ")
                 ));
             }
-            Value::Matrix { .. } => {}
+            Value::Matrix { .. } | Value::Properties(_) => {}
         }
     }
     s.push_str(
@@ -360,7 +407,7 @@ mod tests {
     #[test]
     fn rejects_non_x3f_input() {
         let mut out = Vec::new();
-        let err = x3f_to_tiff(vec![0; 64], &mut out).unwrap_err();
+        let err = x3f_to_tiff(vec![0; 64], &mut out, Mode::Raw).unwrap_err();
         assert!(matches!(err, ConvertError::X3f(Error::NotX3f)));
     }
 }

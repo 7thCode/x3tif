@@ -26,6 +26,8 @@ pub enum Error {
     NoRawImage,
     Unsupported(u32),
     Corrupt(&'static str),
+    /// Calibration data needed for the developed output is missing from the file.
+    MissingCalibration(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -39,6 +41,10 @@ impl fmt::Display for Error {
                 "未対応の機種/形式です (image type 0x{t:08x})。対応: dp Merrill / dp Quattro / sd Quattro"
             ),
             Error::Corrupt(m) => write!(f, "データが壊れています: {m}"),
+            Error::MissingCalibration(m) => write!(
+                f,
+                "現像に必要な校正値がありません ({m})。「生データ」なら変換できます"
+            ),
         }
     }
 }
@@ -221,6 +227,18 @@ impl X3f {
             }
         }
         Ok(Properties(out))
+    }
+
+    /// The white balance name stored in the file header (X3F versions 2.1 up to 3.x only).
+    pub fn header_white_balance(&self) -> Option<String> {
+        let version = Reader::at(&self.data, 4).u32().ok()?;
+        if !(0x0002_0001..0x0004_0000).contains(&version) {
+            return None;
+        }
+        let raw = self.data.get(40..72)?;
+        let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+        let s = String::from_utf8_lossy(&raw[..end]).trim().to_owned();
+        (!s.is_empty()).then_some(s)
     }
 
     /// Embedded JPEG previews/thumbnails; the larger ones carry EXIF.
