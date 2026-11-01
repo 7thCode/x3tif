@@ -76,8 +76,10 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W, mode: Mode) -> Result<(
     let meta = metadata(&props, &camf, &preview, &output);
     match raw {
         Raw::Merrill { width, height, rgb } => {
-            tiff::write_rgb16(out, width, height, &meta, |y, row| {
-                row.copy_from_slice(&rgb[y * width * 3..(y + 1) * width * 3]);
+            let area = active_area(&camf, width, height);
+            tiff::write_rgb16(out, area.width, area.height, &meta, |y, row| {
+                let at = ((y + area.y) * width + area.x) * 3;
+                row.copy_from_slice(&rgb[at..at + area.width * 3]);
                 finish(row);
             })?;
         }
@@ -95,9 +97,12 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W, mode: Mode) -> Result<(
             let height = top_height.min(2 * low_height);
             let xs = taps(width, low_width);
             let ys = taps(height, low_height);
-            tiff::write_rgb16(out, width, height, &meta, |y, row| {
+            let area = active_area(&camf, width, height);
+            tiff::write_rgb16(out, area.width, area.height, &meta, |y, row| {
+                let y = y + area.y;
                 let (y0, y1, wy) = ys[y];
-                for (x, px) in row.chunks_exact_mut(3).enumerate() {
+                for (i, px) in row.chunks_exact_mut(3).enumerate() {
+                    let x = i + area.x;
                     let (x0, x1, wx) = xs[x];
                     for c in 0..2 {
                         let at = |yy: usize, xx: usize| low[(yy * low_width + xx) * 3 + c] as u32;
@@ -113,6 +118,42 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W, mode: Mode) -> Result<(
         }
     }
     Ok(())
+}
+
+/// The part of the decoded image that is actual picture.
+struct Area {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+/// CAMF `ActiveImageArea` (inclusive, in sensor coordinates) relative to the decoded image, which
+/// starts at the origin of `KeepImageArea`. Everything outside it is dark shield and margins.
+/// Falls back to the whole image if the file gives no usable area.
+fn active_area(camf: &Camf, width: usize, height: usize) -> Area {
+    let whole = Area {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let rect = |name: &str| camf.matrix(name).filter(|m| m.len() == 4);
+    let Some(active) = rect("ActiveImageArea") else {
+        return whole;
+    };
+    let (ox, oy) = rect("KeepImageArea").map_or((0.0, 0.0), |k| (k[0], k[1]));
+    let (x0, y0) = (active[0] - ox, active[1] - oy);
+    let (x1, y1) = (active[2] - ox, active[3] - oy);
+    if x0 < 0.0 || y0 < 0.0 || x1 < x0 || y1 < y0 || x1 >= width as f64 || y1 >= height as f64 {
+        return whole;
+    }
+    Area {
+        x: x0 as usize,
+        y: y0 as usize,
+        width: (x1 - x0) as usize + 1,
+        height: (y1 - y0) as usize + 1,
+    }
 }
 
 /// How the pixel values were produced; recorded in the XMP so later tools can undo the scaling.
