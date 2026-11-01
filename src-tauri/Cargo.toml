@@ -1,0 +1,13 @@
+[package]
+name = "x3tif"
+version = "0.1.0"
+edition = "2021"
+description = "Sigma Foveon X3F to 16-bit TIFF converter"
+license = "MIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", default-features = false, features = ["wry", "compression"] }
+x3tif-core = { path = "../core" }

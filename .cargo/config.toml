@@ -1,0 +1,3 @@
+# The shared Tauri workflow looks for bundles under src-tauri/target.
+[build]
+target-dir = "src-tauri/target"
