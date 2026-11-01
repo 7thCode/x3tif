@@ -97,6 +97,36 @@ fn wb_from_code(code: u32) -> &'static str {
     }
 }
 
+/// The table's gains are relative to a green gain of about 0.855, while the per-white-balance
+/// `WBGain` entries are relative to 1. Found by comparing with those entries (about 1.16) and then
+/// tuned against the camera's own JPEG: with 1.17 neutral areas of dp0 Quattro shots come out
+/// within 3% (1.0 would be off by 50%).
+const COLOR_TEMP_GAIN_SCALE: f64 = 1.17;
+
+/// White balance by colour temperature (Quattro "ColorTemp" setting): the gains and colour
+/// matrix are interpolated from `ColorTempTableInfo` at the file's `ColorTempValue`. The table has
+/// one row per temperature: kelvin, blue gain, red gain, then the 3x3 colour matrix.
+fn color_temp_calibration(camf: &Camf) -> Option<(f64, [f64; 3], [f64; 9])> {
+    let kelvin = camf.number("ColorTempValue")?;
+    let table = camf.matrix("ColorTempTableInfo")?;
+    let rows: Vec<&[f64]> = table.chunks_exact(12).collect();
+    let (first, last) = (rows.first()?, rows.last()?);
+    let row: [f64; 12] = if kelvin <= first[0] {
+        (*first).try_into().ok()?
+    } else if kelvin >= last[0] {
+        (*last).try_into().ok()?
+    } else {
+        let i = rows.windows(2).position(|w| kelvin <= w[1][0])?;
+        let (a, b) = (rows[i], rows[i + 1]);
+        let t = (kelvin - a[0]) / (b[0] - a[0]);
+        std::array::from_fn(|c| a[c] + (b[c] - a[c]) * t)
+    };
+    let scale = COLOR_TEMP_GAIN_SCALE;
+    let gain = [row[2] * scale, 1.0, row[1] * scale];
+    let cc: [f64; 9] = std::array::from_fn(|c| row[3 + c]);
+    Some((kelvin, gain, cc))
+}
+
 impl Developer {
     /// `header_wb` is the white balance name from the X3F header (older files only).
     pub fn new(raw: &Raw, camf: &Camf, header_wb: Option<&str>) -> Result<Developer, Error> {
@@ -109,19 +139,28 @@ impl Developer {
             Some(code) => wb_from_code(code as u32).to_owned(),
             None => header_wb.unwrap_or("Auto").to_owned(),
         };
-        let (name, gain, cc) = [canonical_wb(&wanted), "Auto", "Sunlight"]
+        let color_temp = (wanted == "ColorTemp")
+            .then(|| color_temp_calibration(camf))
+            .flatten();
+        let (name, gain, cc) = color_temp
+            .map(|(k, gain, cc)| (format!("ColorTemp {k:.0}K"), gain.to_vec(), cc.to_vec()))
             .into_iter()
-            .find_map(|wb| {
-                let gain = camf
-                    .property("WhiteBalanceGains", wb)
-                    .and_then(|m| camf.matrix(m))
-                    .filter(|m| m.len() == 3)?;
-                let cc = camf
-                    .property("WhiteBalanceColorCorrections", wb)
-                    .and_then(|m| camf.matrix(m))
-                    .filter(|m| m.len() == 9)?;
-                Some((wb.to_owned(), gain.to_vec(), cc.to_vec()))
-            })
+            .chain(
+                [canonical_wb(&wanted), "Auto", "Sunlight"]
+                    .into_iter()
+                    .find_map(|wb| {
+                        let gain = camf
+                            .property("WhiteBalanceGains", wb)
+                            .and_then(|m| camf.matrix(m))
+                            .filter(|m| m.len() == 3)?;
+                        let cc = camf
+                            .property("WhiteBalanceColorCorrections", wb)
+                            .and_then(|m| camf.matrix(m))
+                            .filter(|m| m.len() == 9)?;
+                        Some((wb.to_owned(), gain.to_vec(), cc.to_vec()))
+                    }),
+            )
+            .next()
             .ok_or(Error::MissingCalibration(
                 "WhiteBalanceGains / WhiteBalanceColorCorrections",
             ))?;
@@ -525,6 +564,46 @@ mod tests {
         assert_eq!(d.matrix[0], [0.0, 1.0, 0.0]);
         let d = Developer::new(&raw(), &camf(1.0), None).unwrap();
         assert_eq!(d.matrix[0], [2.0, 0.0, 0.0]);
+    }
+
+    fn color_temp_camf(kelvin: f64) -> Camf {
+        let mut c = camf(11.0);
+        c.0.push(m("ColorTempValue", &[kelvin]));
+        c.0.push(Entry {
+            name: "ColorTempTableInfo".into(),
+            value: Value::Matrix {
+                dims: vec![2, 12],
+                values: vec![
+                    // kelvin, blue gain, red gain, colour matrix (rows sum to 1)
+                    4000.0, 1.0, 0.8, 3.0, -3.0, 1.0, -2.0, 4.0, -1.0, 0.6, -4.6, 5.0, //
+                    6000.0, 0.8, 1.0, 3.0, -3.0, 1.0, -2.0, 4.0, -1.0, 0.6, -4.6, 5.0,
+                ],
+            },
+        });
+        c
+    }
+
+    #[test]
+    fn color_temp_interpolates_the_table() {
+        let (k, gain, cc) = color_temp_calibration(&color_temp_camf(5000.0)).unwrap();
+        assert_eq!(k, 5000.0);
+        // Halfway: red 0.9, blue 0.9, each scaled to the WBGain convention; green stays 1.
+        assert!((gain[0] - 0.9 * COLOR_TEMP_GAIN_SCALE).abs() < 1e-9);
+        assert!((gain[2] - 0.9 * COLOR_TEMP_GAIN_SCALE).abs() < 1e-9);
+        assert_eq!(gain[1], 1.0);
+        assert_eq!(&cc[..3], &[3.0, -3.0, 1.0]);
+        // Outside the table the nearest row is used.
+        let (_, low, _) = color_temp_calibration(&color_temp_camf(1000.0)).unwrap();
+        assert!((low[0] - 0.8 * COLOR_TEMP_GAIN_SCALE).abs() < 1e-9);
+    }
+
+    #[test]
+    fn color_temp_setting_uses_the_table_instead_of_auto() {
+        let d = Developer::new(&raw(), &color_temp_camf(5000.0), None).unwrap();
+        assert_eq!(d.white_balance, "ColorTemp 5000K");
+        // Without the table it falls back to Auto as before.
+        let d = Developer::new(&raw(), &camf(11.0), None).unwrap();
+        assert_eq!(d.white_balance, "Auto");
     }
 
     #[test]
