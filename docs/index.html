@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PROJECT_NAME</title>
+    <title>x3tif</title>
     <style>
       :root {
         --bg: #ffffff;
@@ -117,17 +117,17 @@
   </head>
   <body>
     <main>
-      <h1>PROJECT_NAME</h1>
-      <p class="subtitle">PROJECT_DESCRIPTION</p>
+      <h1>x3tif</h1>
+      <p class="subtitle">Sigma Foveon の X3F を、現像せずに 16bit TIFF へ変換するデスクトップアプリ。ファイルをドロップするだけ。</p>
 
-      <p><strong>最新版: vX.Y.Z</strong></p>
+      <p><strong>最新版: v0.1.0</strong></p>
       <div class="download-grid">
         <div class="download-card">
           <strong>macOS</strong>
-          <span class="platform-sub">Apple Silicon (arm64)</span>
+          <span class="platform-sub">Universal(Apple Silicon / Intel)</span>
           <a
             class="download-button"
-            href="https://github.com/OWNER/REPO/releases/download/vX.Y.Z/REPO-X.Y.Z.dmg"
+            href="https://github.com/7thCode/x3tif/releases/download/v0.1.0/x3tif_0.1.0_universal.dmg"
           >
             .dmg をダウンロード
           </a>
@@ -137,7 +137,7 @@
           <span class="platform-sub">64bit (x64)</span>
           <a
             class="download-button"
-            href="https://github.com/OWNER/REPO/releases/download/vX.Y.Z/REPO-X.Y.Z-setup.exe"
+            href="https://github.com/7thCode/x3tif/releases/download/v0.1.0/x3tif_0.1.0_x64-setup.exe"
           >
             .exe をダウンロード
           </a>
@@ -147,28 +147,30 @@
           <span class="platform-sub">AppImage / 64bit (x64)</span>
           <a
             class="download-button"
-            href="https://github.com/OWNER/REPO/releases/download/vX.Y.Z/REPO-X.Y.Z.AppImage"
+            href="https://github.com/7thCode/x3tif/releases/download/v0.1.0/x3tif_0.1.0_amd64.AppImage"
           >
             .AppImage をダウンロード
           </a>
         </div>
       </div>
       <p class="meta">
-        過去のリリース一覧は <a href="https://github.com/OWNER/REPO/releases">Releases</a> から確認できます。
+        過去のリリース一覧は <a href="https://github.com/7thCode/x3tif/releases">Releases</a> から確認できます。
       </p>
 
       <h2>主な機能</h2>
       <ul>
-        <li>FEATURE_1</li>
-        <li>FEATURE_2</li>
+        <li>対応機種: dp Merrill / dp Quattro / sd Quattro(H)</li>
+        <li>センサー値をそのまま 16bit リニア RGB の TIFF に保存(WB・色変換・ガンマなし)</li>
+        <li>機種名・撮影日時・向き・EXIF と、WB ゲイン・色マトリクスなどの校正値(XMP)を埋め込み</li>
+        <li>X3F をウィンドウにドロップすると、同じフォルダに <code>.tif</code> を作成(既存ファイルは上書きしません)</li>
       </ul>
 
       <h2>ソースコード</h2>
       <p>
-        <a href="https://github.com/OWNER/REPO">github.com/OWNER/REPO</a>
+        <a href="https://github.com/7thCode/x3tif">github.com/7thCode/x3tif</a>
       </p>
 
-      <footer>FOOTER_TEXT</footer>
+      <footer>X3F のデコードは x3f_tools(BSD スタイルライセンス)を参照して実装しています。</footer>
     </main>
   </body>
 </html>
