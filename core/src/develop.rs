@@ -79,6 +79,121 @@ pub fn repair_highlight_pixels(raw: &mut Raw, camf: &Camf) {
     }
 }
 
+/// Autofocus pixels of the sd Quattro (id 40) and sd Quattro H (id 41): regular grids that read low
+/// in the luma (top) and chroma (low) layers. Positions are not in the file; these are the ones
+/// x3f_tools uses (first column, last column, column pitch, width, first row, last row, row pitch,
+/// height). The sd Quattro grids were checked against a sample (pixels read 8-15% low); the
+/// sd Quattro H ones are taken from x3f_tools as they are.
+struct Grid(usize, usize, usize, usize, usize, usize, usize, usize);
+
+impl Grid {
+    fn points(&self) -> Vec<(usize, usize)> {
+        let Grid(ci, cf, cp, cs, ri, rf, rp, rs) = *self;
+        let mut out = Vec::new();
+        for row in (ri..=rf).step_by(rp) {
+            for col in (ci..=cf).step_by(cp) {
+                for r in 0..rs {
+                    for c in 0..cs {
+                        out.push((col + c, row + r));
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Replaces the given pixels of an interleaved image by the mean of their usable neighbours:
+/// all four when possible, otherwise the horizontal or the vertical pair (as x3f_tools does).
+fn interpolate_pixels(
+    data: &mut [u16],
+    width: usize,
+    height: usize,
+    channels: usize,
+    points: &[(usize, usize)],
+) {
+    let mut bad = vec![false; width * height];
+    let points: Vec<_> = points
+        .iter()
+        .copied()
+        .filter(|&(x, y)| x < width && y < height)
+        .collect();
+    for &(x, y) in &points {
+        bad[y * width + x] = true;
+    }
+    let usable = |x: isize, y: isize| {
+        (x >= 0
+            && y >= 0
+            && (x as usize) < width
+            && (y as usize) < height
+            && !bad[y as usize * width + x as usize])
+            .then_some((x as usize, y as usize))
+    };
+    let fixes: Vec<_> = points
+        .iter()
+        .map(|&(x, y)| {
+            let (xi, yi) = (x as isize, y as isize);
+            let n = [
+                usable(xi - 1, yi),
+                usable(xi + 1, yi),
+                usable(xi, yi - 1),
+                usable(xi, yi + 1),
+            ];
+            let chosen: Vec<(usize, usize)> = if n.iter().all(Option::is_some) {
+                n.iter().flatten().copied().collect()
+            } else if n[0].is_some() && n[1].is_some() {
+                vec![n[0].unwrap(), n[1].unwrap()]
+            } else if n[2].is_some() && n[3].is_some() {
+                vec![n[2].unwrap(), n[3].unwrap()]
+            } else {
+                n.iter().flatten().copied().collect()
+            };
+            (x, y, chosen)
+        })
+        .collect();
+    for (x, y, chosen) in fixes {
+        if chosen.is_empty() {
+            continue;
+        }
+        for c in 0..channels {
+            let sum: u32 = chosen
+                .iter()
+                .map(|&(nx, ny)| data[(ny * width + nx) * channels + c] as u32)
+                .sum();
+            let n = chosen.len() as u32;
+            data[(y * width + x) * channels + c] = ((sum + n / 2) / n) as u16;
+        }
+    }
+}
+
+/// Interpolates over the autofocus pixels of sd Quattro / sd Quattro H files.
+pub fn repair_autofocus_pixels(raw: &mut Raw, camf: &Camf) {
+    let Raw::Quattro {
+        low_width,
+        low_height,
+        low,
+        top_width,
+        top_height,
+        top,
+    } = raw
+    else {
+        return;
+    };
+    let (luma, chroma) = match camf.number("CAMERAID").map(|v| v as u32) {
+        Some(40) => (
+            Grid(217, 5641, 16, 1, 464, 3312, 32, 2),
+            Grid(108, 2820, 8, 1, 232, 1656, 16, 1),
+        ),
+        Some(41) => (
+            Grid(233, 6425, 16, 1, 592, 3888, 32, 2),
+            Grid(116, 2820, 8, 1, 296, 1944, 16, 1),
+        ),
+        _ => return,
+    };
+    interpolate_pixels(top, *top_width, *top_height, 1, &luma.points());
+    interpolate_pixels(low, *low_width, *low_height, 3, &chroma.points());
+}
+
 /// Sensor bit depth from CAMF (`ImageDepth`); 14 bit is what Quattro and 12 bit what Merrill report.
 fn image_depth(camf: &Camf) -> Option<u32> {
     camf.number("ImageDepth")
@@ -654,6 +769,31 @@ mod tests {
         let mut untouched = quattro();
         repair_highlight_pixels(&mut untouched, &Camf::default());
         assert_eq!(pixel(&untouched), 50);
+    }
+
+    #[test]
+    fn autofocus_grid_pixels_are_interpolated_for_sd_quattro_only() {
+        let quattro = || Raw::Quattro {
+            low_width: 4,
+            low_height: 4,
+            low: vec![100; 4 * 4 * 3],
+            top_width: 8,
+            top_height: 8,
+            top: vec![100; 64],
+        };
+        // The real grids sit far outside this tiny image, so check the interpolation directly.
+        let mut data = vec![100u16; 6 * 6];
+        data[2 * 6 + 2] = 40;
+        data[2 * 6 + 3] = 40; // two vertically-adjacent-free neighbours (horizontal pair of bad pixels)
+        interpolate_pixels(&mut data, 6, 6, 1, &[(2, 2), (3, 2)]);
+        assert_eq!((data[2 * 6 + 2], data[2 * 6 + 3]), (100, 100));
+        // Other cameras are left alone.
+        let mut raw = quattro();
+        repair_autofocus_pixels(&mut raw, &Camf(vec![m("CAMERAID", &[83.0])]));
+        let Raw::Quattro { top, .. } = &raw else {
+            unreachable!()
+        };
+        assert!(top.iter().all(|&v| v == 100));
     }
 
     #[test]
