@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>x3tif</title>
+<style>
+  :root { color-scheme: light dark; font-family: -apple-system, "Segoe UI", sans-serif; }
+  body { margin: 0; height: 100vh; display: flex; flex-direction: column; box-sizing: border-box; padding: 14px; gap: 10px; }
+  #drop { flex: 1; min-height: 90px; display: flex; align-items: center; justify-content: center; text-align: center;
+          border: 2px dashed #8888; border-radius: 12px; color: #888; transition: .15s; }
+  body.over #drop { border-color: #3b82f6; color: #3b82f6; background: #3b82f622; }
+  ul { list-style: none; margin: 0; padding: 0; max-height: 45vh; overflow: auto; font-size: 12px; }
+  li { padding: 3px 0; display: flex; gap: 6px; }
+  li .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  li.ok .state { color: #16a34a; } li.err .state { color: #dc2626; } li.run .state { color: #888; }
+</style>
+</head>
+<body>
+  <div id="drop">X3F ファイルをここにドロップ<br>→ 16bit TIFF に変換(同じフォルダに保存)</div>
+  <ul id="log"></ul>
+<script>
+  const { listen } = window.__TAURI__.event;
+  const { invoke } = window.__TAURI__.core;
+  const log = document.getElementById('log');
+  const base = p => p.split(/[\\/]/).pop();
+
+  function row(path) {
+    const li = document.createElement('li');
+    li.className = 'run';
+    li.innerHTML = '<span class="name"></span><span class="state">変換中…</span>';
+    li.querySelector('.name').textContent = base(path);
+    log.prepend(li);
+    return li;
+  }
+
+  // Convert one at a time: each decode holds the whole file and image in memory.
+  let queue = Promise.resolve();
+  function enqueue(path) {
+    const li = row(path);
+    queue = queue.then(async () => {
+      const state = li.querySelector('.state');
+      try {
+        const out = await invoke('convert', { path });
+        li.className = 'ok'; state.textContent = '→ ' + base(out);
+      } catch (e) {
+        li.className = 'err'; state.textContent = String(e);
+      }
+    });
+  }
+
+  listen('tauri://drag-enter', () => document.body.classList.add('over'));
+  listen('tauri://drag-leave', () => document.body.classList.remove('over'));
+  listen('tauri://drag-drop', e => {
+    document.body.classList.remove('over');
+    e.payload.paths.forEach(enqueue);
+  });
+</script>
+</body>
+</html>

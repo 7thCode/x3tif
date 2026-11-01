@@ -1,0 +1,13 @@
+{
+  "name": "x3tif",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sigma Foveon X3F to 16-bit TIFF converter",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
