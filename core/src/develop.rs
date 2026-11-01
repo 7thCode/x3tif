@@ -97,6 +97,11 @@ fn wb_from_code(code: u32) -> &'static str {
     }
 }
 
+/// Photo Pro renders Merrill files with a red gain about 4.5% above the file's white balance
+/// gain (fitted against its TIFF output; the camera JPEGs of four more files agree within
+/// 1.038-1.044). Quattro needs no such trim (0.8%).
+const MERRILL_RED_TRIM: f64 = 1.04;
+
 /// The table's gains are relative to a green gain of about 0.855, while the per-white-balance
 /// `WBGain` entries are relative to 1. Found by comparing with those entries (about 1.16) and then
 /// tuned against the camera's own JPEG: with 1.17 neutral areas of dp0 Quattro shots come out
@@ -177,18 +182,13 @@ impl Developer {
                 }
             }
         }
+        if matches!(raw, Raw::Merrill { .. }) {
+            gain[0] *= MERRILL_RED_TRIM;
+        }
         let iso = match (camf.number("CaptureISO"), camf.number("SensorISO")) {
             (Some(c), Some(s)) if s > 0.0 => c / s,
             _ => 1.0,
         };
-        // Merrill files carry a second, much milder colour matrix (CP2). The per-white-balance
-        // CCMatrix has coefficients up to about -4, so a few percent of white balance error turns
-        // into a strong colour cast; against the camera's own JPEG, neutral areas come out about
-        // 11% off with CCMatrix and within 3% with CP2. Files without it use the CCMatrix.
-        let cc = camf
-            .matrix("CP2_Matrix")
-            .filter(|m| m.len() == 9)
-            .map_or(cc, <[f64]>::to_vec);
         let mut matrix = [[0.0; 3]; 3];
         for (i, row) in matrix.iter_mut().enumerate() {
             for (j, m) in row.iter_mut().enumerate() {
@@ -506,12 +506,15 @@ mod tests {
     #[test]
     fn white_balance_gain_scales_red_before_the_curve() {
         let d = Developer::new(&raw(), &camf(1.0), None).unwrap();
-        // Normalised input 0.1 on every channel; red gain 2 -> 0.2 linear, others 0.1.
+        // Normalised input 0.1 on every channel; red gain 2 (times the Merrill trim) -> 0.2 linear, others 0.1.
         let v = 100.0 + 0.1 * (4095.0 - 100.0);
         let mut row = [v as u16; 3];
         d.apply(&mut row);
         let enc = |l: f64| (encode(l) * 65535.0).round();
-        assert!((row[0] as f64 - enc(0.2)).abs() < 40.0, "{row:?}");
+        assert!(
+            (row[0] as f64 - enc(0.2 * MERRILL_RED_TRIM)).abs() < 40.0,
+            "{row:?}"
+        );
         assert!((row[1] as f64 - enc(0.1)).abs() < 40.0, "{row:?}");
     }
 
@@ -550,20 +553,6 @@ mod tests {
         assert_eq!(encode(0.0), 0.0);
         assert!((encode(1.0) - 1.0).abs() < 1e-12);
         assert!(encode(0.3) < srgb_encode(0.3) || encode(0.9) > srgb_encode(0.9));
-    }
-
-    #[test]
-    fn cp2_matrix_replaces_the_white_balance_matrix_when_present() {
-        let mut c = camf(1.0);
-        // Swap red and green outputs so the effect is visible.
-        c.0.push(m(
-            "CP2_Matrix",
-            &[0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-        ));
-        let d = Developer::new(&raw(), &c, None).unwrap();
-        assert_eq!(d.matrix[0], [0.0, 1.0, 0.0]);
-        let d = Developer::new(&raw(), &camf(1.0), None).unwrap();
-        assert_eq!(d.matrix[0], [2.0, 0.0, 0.0]);
     }
 
     fn color_temp_camf(kelvin: f64) -> Camf {
