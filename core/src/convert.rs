@@ -1,6 +1,7 @@
 //! X3F → 16 bit TIFF conversion (raw sensor values, no development).
 
 use crate::camf::{Camf, Value};
+use crate::exif::{self, PreviewExif};
 use crate::tiff::{self, Exif, Metadata};
 use crate::x3f::{Error, Properties, Raw, X3f};
 use std::io::{self, Write};
@@ -40,7 +41,11 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W) -> Result<(), ConvertEr
     let props = x3f.properties()?;
     // Metadata is best effort: an unreadable CAMF must not block the conversion.
     let camf = x3f.camf().ok().flatten().unwrap_or_default();
-    let meta = metadata(&props, &camf);
+    let preview = x3f
+        .preview_jpegs()
+        .find_map(exif::from_jpeg)
+        .unwrap_or_default();
+    let meta = metadata(&props, &camf, &preview);
     match x3f.decode()? {
         Raw::Merrill { width, height, rgb } => {
             tiff::write_rgb16(out, width, height, &meta, |y, row| {
@@ -152,10 +157,10 @@ fn nominal_shutter(props: &Properties) -> Option<(u32, u32)> {
     }
 }
 
-fn exif(props: &Properties, camf: &Camf) -> Exif {
+fn exif(props: &Properties, camf: &Camf, preview: &PreviewExif) -> Exif {
     let prop = |name: &str| props.get(name).and_then(|v| v.trim().parse::<f64>().ok());
     // PROP (Merrill) first, CAMF (Quattro) as the fallback. CAMF shutter values are not in
-    // a verified unit, so exposure time comes from PROP only.
+    // a verified unit, so exposure time comes from PROP or the preview JPEG's EXIF.
     // Prefer the nominal values the camera displays (f/5.6, 1/320) over the measured ones.
     let f_number = prop("AP_DESC")
         .or_else(|| prop("APERTURE"))
@@ -163,7 +168,10 @@ fn exif(props: &Properties, camf: &Camf) -> Exif {
     let iso = prop("ISO").or_else(|| camf.number("CaptureISO"));
     let bias = prop("EXPCOMP").or_else(|| camf.number("CaptureExpComp"));
     Exif {
-        exposure_time: nominal_shutter(props).or_else(|| prop("SHUTTER").and_then(exposure_time)),
+        exposure_time: nominal_shutter(props)
+            .or_else(|| prop("SHUTTER").and_then(exposure_time))
+            .or(preview.exposure_time),
+        datetime_original: preview.datetime_original.clone(),
         f_number: f_number.and_then(|v| ratio(v, 10)),
         iso: iso.map(|v| v.round().clamp(0.0, u16::MAX as f64) as u16),
         exposure_bias: bias.map(|v| ((v * 100.0).round() as i32, 100)),
@@ -171,7 +179,7 @@ fn exif(props: &Properties, camf: &Camf) -> Exif {
     }
 }
 
-fn metadata(props: &Properties, camf: &Camf) -> Metadata {
+fn metadata(props: &Properties, camf: &Camf, preview: &PreviewExif) -> Metadata {
     let model = props
         .get("CAMMODEL")
         .map(|m| m.trim_start_matches("SIGMA ").to_owned())
@@ -184,8 +192,12 @@ fn metadata(props: &Properties, camf: &Camf) -> Metadata {
         make: Some("SIGMA".into()),
         model,
         software: Some(concat!("x3tif ", env!("CARGO_PKG_VERSION")).into()),
-        datetime: None,
-        exif: exif(props, camf),
+        datetime: preview
+            .datetime
+            .clone()
+            .or_else(|| preview.datetime_original.clone()),
+        orientation: preview.orientation,
+        exif: exif(props, camf, preview),
         xmp: Some(xmp(props, camf)),
     }
 }
@@ -281,12 +293,27 @@ mod tests {
             ("EXPCOMP", "+0.00"),
             ("FLENGTH", "19"),
         ]);
-        let e = exif(&p, &Camf::default());
+        let e = exif(&p, &Camf::default(), &PreviewExif::default());
         assert_eq!(e.f_number, Some((28, 5)));
         assert_eq!(e.exposure_time, Some((1, 320)));
         assert_eq!(e.iso, Some(100));
         assert_eq!(e.exposure_bias, Some((0, 100)));
         assert_eq!(e.focal_length, Some((19, 1)));
+    }
+
+    #[test]
+    fn preview_exif_fills_exposure_time_and_date_when_nothing_else_has_them() {
+        let preview = PreviewExif {
+            exposure_time: Some((1, 250)),
+            datetime_original: Some("2023:02:25 10:20:29".into()),
+            ..Default::default()
+        };
+        let e = exif(&props(&[]), &Camf::default(), &preview);
+        assert_eq!(e.exposure_time, Some((1, 250)));
+        assert_eq!(e.datetime_original.as_deref(), Some("2023:02:25 10:20:29"));
+        // Camera-displayed PROP values still win over the preview.
+        let e = exif(&props(&[("SH_DESC", "1/320")]), &Camf::default(), &preview);
+        assert_eq!(e.exposure_time, Some((1, 320)));
     }
 
     #[test]
@@ -314,7 +341,7 @@ mod tests {
                 },
             },
         ]);
-        let e = exif(&props(&[]), &camf);
+        let e = exif(&props(&[]), &camf, &PreviewExif::default());
         assert_eq!(e.f_number, Some((28, 5)));
         assert_eq!(e.iso, Some(100));
         assert_eq!(e.exposure_time, None);

@@ -13,6 +13,7 @@ const CAMF_HEADER_SIZE: usize = 28;
 const PROPERTY_HEADER_SIZE: usize = 24;
 const TRUE_PLANES: usize = 3;
 
+const TYPE_PREVIEW: u32 = 2;
 const FORMAT_MERRILL: u32 = 0x0001_001e;
 const FORMAT_QUATTRO: u32 = 0x0001_0023;
 const FORMAT_SDQ: u32 = 0x0001_0025;
@@ -220,6 +221,20 @@ impl X3f {
             }
         }
         Ok(Properties(out))
+    }
+
+    /// Embedded JPEG previews/thumbnails; the larger ones carry EXIF.
+    pub fn preview_jpegs(&self) -> impl Iterator<Item = &[u8]> {
+        self.entries.iter().filter_map(|e| {
+            if self.section_id(e).ok()? != SECI {
+                return None;
+            }
+            let ty = Reader::at(&self.data, e.offset + 8).u32().ok()?;
+            let body = self
+                .data
+                .get(e.offset + IMAGE_HEADER_SIZE..e.offset + e.size)?;
+            (ty == TYPE_PREVIEW && body.starts_with(&[0xff, 0xd8])).then_some(body)
+        })
     }
 
     /// Decodes the camera metadata block, if the file has one.

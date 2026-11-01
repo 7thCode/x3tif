@@ -9,7 +9,10 @@ pub struct Metadata {
     pub make: Option<String>,
     pub model: Option<String>,
     pub software: Option<String>,
+    /// "YYYY:MM:DD HH:MM:SS"
     pub datetime: Option<String>,
+    /// TIFF Orientation tag value, 1..=8.
+    pub orientation: Option<u16>,
     pub exif: Exif,
     /// Raw XMP packet (tag 700).
     pub xmp: Option<Vec<u8>>,
@@ -21,6 +24,8 @@ pub struct Exif {
     pub exposure_time: Option<(u32, u32)>,
     pub f_number: Option<(u32, u32)>,
     pub iso: Option<u16>,
+    /// "YYYY:MM:DD HH:MM:SS"
+    pub datetime_original: Option<String>,
     pub exposure_bias: Option<(i32, i32)>,
     pub focal_length: Option<(u32, u32)>,
 }
@@ -30,6 +35,7 @@ impl Exif {
         self.exposure_time.is_none()
             && self.f_number.is_none()
             && self.iso.is_none()
+            && self.datetime_original.is_none()
             && self.exposure_bias.is_none()
             && self.focal_length.is_none()
     }
@@ -175,6 +181,9 @@ pub fn write_rgb16<W: Write>(
         if let Some(v) = e.iso {
             tags.push(short(34855, v));
         }
+        if let Some(v) = &e.datetime_original {
+            tags.push(ascii(36867, v));
+        }
         if let Some(v) = e.exposure_bias {
             tags.push(srational(37380, v));
         }
@@ -209,6 +218,9 @@ pub fn write_rgb16<W: Write>(
     }
     let strip_offsets_at = tags.len();
     tags.push(extra(273, LONG, strips as u32, vec![0; strips * 4]));
+    if let Some(v) = meta.orientation {
+        tags.push(short(274, v));
+    }
     tags.push(short(277, 3));
     tags.push(long(278, ROWS_PER_STRIP as u32));
     tags.push(extra(
@@ -324,12 +336,18 @@ mod tests {
                 iso: Some(200),
                 ..Default::default()
             },
+            orientation: Some(6),
             ..Default::default()
         };
         write_rgb16(&mut out, 2, 2, &meta, |_, row| row.fill(7)).unwrap();
 
         let ifd0 = u32_at(&out, 4) as usize;
         let n = u16_at(&out, ifd0) as usize;
+        let orientation = (0..n)
+            .map(|i| ifd0 + 2 + i * 12)
+            .find(|&e| u16_at(&out, e) == 274)
+            .map(|e| u16_at(&out, e + 8));
+        assert_eq!(orientation, Some(6));
         let exif_at = (0..n)
             .map(|i| ifd0 + 2 + i * 12)
             .find(|&e| u16_at(&out, e) == 34665)
