@@ -1,6 +1,7 @@
 //! X3F → 16 bit TIFF conversion (raw sensor values, no development).
 
-use crate::tiff::{self, Metadata};
+use crate::camf::{Camf, Value};
+use crate::tiff::{self, Exif, Metadata};
 use crate::x3f::{Error, Properties, Raw, X3f};
 use std::io::{self, Write};
 
@@ -37,14 +38,23 @@ impl From<io::Error> for ConvertError {
 pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W) -> Result<(), ConvertError> {
     let x3f = X3f::parse(data)?;
     let props = x3f.properties()?;
-    let meta = metadata(&props);
+    // Metadata is best effort: an unreadable CAMF must not block the conversion.
+    let camf = x3f.camf().ok().flatten().unwrap_or_default();
+    let meta = metadata(&props, &camf);
     match x3f.decode()? {
         Raw::Merrill { width, height, rgb } => {
             tiff::write_rgb16(out, width, height, &meta, |y, row| {
                 row.copy_from_slice(&rgb[y * width * 3..(y + 1) * width * 3]);
             })?;
         }
-        Raw::Quattro { low_width, low_height, low, top_width, top_height, top } => {
+        Raw::Quattro {
+            low_width,
+            low_height,
+            low,
+            top_width,
+            top_height,
+            top,
+        } => {
             // The top layer is wider than the area the lower layers cover; as in x3f_tools'
             // Quattro expansion, the output is limited to that area (both share the origin).
             let width = top_width.min(2 * low_width);
@@ -86,13 +96,97 @@ fn taps(full: usize, low: usize) -> Vec<(usize, usize, u32)> {
         .collect()
 }
 
-fn metadata(props: &Properties) -> Metadata {
+/// Camera model from the CAMF camera id (used when the file has no PROP section).
+fn model_from_id(id: u32) -> Option<&'static str> {
+    Some(match id {
+        77 => "dp1 Merrill",
+        78 => "dp2/dp3 Merrill",
+        83 => "dp0 Quattro",
+        80 => "dp1 Quattro",
+        81 => "dp2 Quattro",
+        82 => "dp3 Quattro",
+        40 => "sd Quattro",
+        41 => "sd Quattro H",
+        _ => return None,
+    })
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+/// `v` as a reduced fraction with the given denominator scale.
+fn ratio(v: f64, scale: u32) -> Option<(u32, u32)> {
+    if !v.is_finite() || v < 0.0 {
+        return None;
+    }
+    let n = (v * scale as f64).round() as u64;
+    let g = gcd(n, scale as u64).max(1);
+    Some(((n / g) as u32, (scale as u64 / g) as u32))
+}
+
+fn exposure_time(seconds: f64) -> Option<(u32, u32)> {
+    if !(seconds.is_finite() && seconds > 0.0) {
+        return None;
+    }
+    if seconds < 1.0 {
+        Some((1, (1.0 / seconds).round() as u32))
+    } else {
+        ratio(seconds, 1000)
+    }
+}
+
+/// `SH_DESC` is "1/320" for fast shutters or plain seconds ("2.5") for slow ones.
+fn nominal_shutter(props: &Properties) -> Option<(u32, u32)> {
+    let d = props.get("SH_DESC")?.trim();
+    match d.split_once('/') {
+        Some((n, den)) => Some((
+            n.trim().parse().ok().filter(|&n| n > 0)?,
+            den.trim().parse().ok().filter(|&d| d > 0)?,
+        )),
+        None => exposure_time(d.parse().ok()?),
+    }
+}
+
+fn exif(props: &Properties, camf: &Camf) -> Exif {
+    let prop = |name: &str| props.get(name).and_then(|v| v.trim().parse::<f64>().ok());
+    // PROP (Merrill) first, CAMF (Quattro) as the fallback. CAMF shutter values are not in
+    // a verified unit, so exposure time comes from PROP only.
+    // Prefer the nominal values the camera displays (f/5.6, 1/320) over the measured ones.
+    let f_number = prop("AP_DESC")
+        .or_else(|| prop("APERTURE"))
+        .or_else(|| camf.number("CaptureAperture"));
+    let iso = prop("ISO").or_else(|| camf.number("CaptureISO"));
+    let bias = prop("EXPCOMP").or_else(|| camf.number("CaptureExpComp"));
+    Exif {
+        exposure_time: nominal_shutter(props).or_else(|| prop("SHUTTER").and_then(exposure_time)),
+        f_number: f_number.and_then(|v| ratio(v, 10)),
+        iso: iso.map(|v| v.round().clamp(0.0, u16::MAX as f64) as u16),
+        exposure_bias: bias.map(|v| ((v * 100.0).round() as i32, 100)),
+        focal_length: prop("FLENGTH").and_then(|v| ratio(v, 10)),
+    }
+}
+
+fn metadata(props: &Properties, camf: &Camf) -> Metadata {
+    let model = props
+        .get("CAMMODEL")
+        .map(|m| m.trim_start_matches("SIGMA ").to_owned())
+        .or_else(|| {
+            camf.number("CAMERAID")
+                .and_then(|id| model_from_id(id as u32))
+                .map(str::to_owned)
+        });
     Metadata {
         make: Some("SIGMA".into()),
-        model: props.get("CAMMODEL").map(str::to_owned),
+        model,
         software: Some(concat!("x3tif ", env!("CARGO_PKG_VERSION")).into()),
         datetime: None,
-        xmp: Some(xmp(props)),
+        exif: exif(props, camf),
+        xmp: Some(xmp(props, camf)),
     }
 }
 
@@ -103,14 +197,26 @@ fn xml_escape(s: &str) -> String {
             '<' => "&lt;".into(),
             '>' => "&gt;".into(),
             '"' => "&quot;".into(),
+            '\n' => "&#10;".into(),
             c if (c as u32) < 0x20 => String::new(),
             c => c.to_string(),
         })
         .collect()
 }
 
-/// All X3F PROP key/values under an `x3f:` namespace so nothing is lost.
-fn xmp(props: &Properties) -> Vec<u8> {
+fn number(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{v}")
+    } else {
+        // CAMF floats are single precision; print them as such.
+        format!("{}", v as f32)
+    }
+}
+
+/// X3F PROP and CAMF entries under an `x3f:` namespace (white balance gains, colour matrices,
+/// image areas, raw offset, ...) so the calibration data travels with the pixels. Large
+/// per-pixel tables are left out.
+fn xmp(props: &Properties, camf: &Camf) -> Vec<u8> {
     let mut s = String::from(
         "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
          <x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n\
@@ -124,13 +230,95 @@ fn xmp(props: &Properties) -> Vec<u8> {
             xml_escape(v)
         ));
     }
-    s.push_str("</rdf:Bag></x3f:Properties>\n</rdf:Description></rdf:RDF></x:xmpmeta>\n<?xpacket end=\"w\"?>");
+    s.push_str("</rdf:Bag></x3f:Properties>\n<x3f:Camf><rdf:Bag>\n");
+    for e in &camf.0 {
+        match &e.value {
+            Value::Text(t) => s.push_str(&format!(
+                "<rdf:li x3f:name=\"{}\" x3f:value=\"{}\"/>\n",
+                xml_escape(&e.name),
+                xml_escape(t)
+            )),
+            Value::Matrix { dims, values } if !values.is_empty() => {
+                let dims: Vec<String> = dims.iter().map(usize::to_string).collect();
+                let vals: Vec<String> = values.iter().map(|&v| number(v)).collect();
+                s.push_str(&format!(
+                    "<rdf:li x3f:name=\"{}\" x3f:dims=\"{}\" x3f:value=\"{}\"/>\n",
+                    xml_escape(&e.name),
+                    dims.join("x"),
+                    vals.join(" ")
+                ));
+            }
+            Value::Matrix { .. } => {}
+        }
+    }
+    s.push_str(
+        "</rdf:Bag></x3f:Camf>\n</rdf:Description></rdf:RDF></x:xmpmeta>\n<?xpacket end=\"w\"?>",
+    );
     s.into_bytes()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn props(pairs: &[(&str, &str)]) -> Properties {
+        Properties(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn exif_prefers_nominal_camera_values() {
+        let p = props(&[
+            ("AP_DESC", "5.6"),
+            ("APERTURE", "5.65685"),
+            ("SH_DESC", "1/320"),
+            ("SHUTTER", "0.00301"),
+            ("ISO", "100"),
+            ("EXPCOMP", "+0.00"),
+            ("FLENGTH", "19"),
+        ]);
+        let e = exif(&p, &Camf::default());
+        assert_eq!(e.f_number, Some((28, 5)));
+        assert_eq!(e.exposure_time, Some((1, 320)));
+        assert_eq!(e.iso, Some(100));
+        assert_eq!(e.exposure_bias, Some((0, 100)));
+        assert_eq!(e.focal_length, Some((19, 1)));
+    }
+
+    #[test]
+    fn slow_shutter_is_written_in_seconds() {
+        assert_eq!(nominal_shutter(&props(&[("SH_DESC", "2.5")])), Some((5, 2)));
+        assert_eq!(nominal_shutter(&props(&[("SH_DESC", "30")])), Some((30, 1)));
+        assert_eq!(nominal_shutter(&props(&[("SH_DESC", "garbage")])), None);
+    }
+
+    #[test]
+    fn exif_falls_back_to_camf_when_no_properties() {
+        let camf = Camf(vec![
+            crate::camf::Entry {
+                name: "CaptureAperture".into(),
+                value: Value::Matrix {
+                    dims: vec![1],
+                    values: vec![5.599999904632568],
+                },
+            },
+            crate::camf::Entry {
+                name: "CaptureISO".into(),
+                value: Value::Matrix {
+                    dims: vec![1],
+                    values: vec![100.0],
+                },
+            },
+        ]);
+        let e = exif(&props(&[]), &camf);
+        assert_eq!(e.f_number, Some((28, 5)));
+        assert_eq!(e.iso, Some(100));
+        assert_eq!(e.exposure_time, None);
+    }
 
     #[test]
     fn taps_interpolate_with_origin_aligned_quarter_weights() {

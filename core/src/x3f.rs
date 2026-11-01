@@ -1,12 +1,15 @@
 //! Minimal X3F reader for dp Merrill, dp Quattro and sd Quattro (TRUE-compressed RAW).
 
+use crate::camf::{self, Camf};
 use std::fmt;
 
 const FOVB: u32 = 0x6256_4f46;
 const SECP: u32 = 0x7043_4553;
 const SECI: u32 = 0x6943_4553;
+const SECC: u32 = 0x6343_4553;
 
 const IMAGE_HEADER_SIZE: usize = 28;
+const CAMF_HEADER_SIZE: usize = 28;
 const PROPERTY_HEADER_SIZE: usize = 24;
 const TRUE_PLANES: usize = 3;
 
@@ -89,7 +92,11 @@ pub struct X3f {
 /// Decoded sensor data, 16 bit per sample, no processing applied.
 pub enum Raw {
     /// dp Merrill: three full-resolution layers, interleaved (R, G, B order of the layer index).
-    Merrill { width: usize, height: usize, rgb: Vec<u16> },
+    Merrill {
+        width: usize,
+        height: usize,
+        rgb: Vec<u16>,
+    },
     /// Quattro: two quarter-size layers (interleaved in `low`, channel 2 unused) plus a
     /// full-resolution top layer.
     Quattro {
@@ -106,7 +113,10 @@ pub struct Properties(pub Vec<(String, String)>);
 
 impl Properties {
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.0.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+        self.0
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
     }
 }
 
@@ -212,6 +222,24 @@ impl X3f {
         Ok(Properties(out))
     }
 
+    /// Decodes the camera metadata block, if the file has one.
+    pub fn camf(&self) -> Result<Option<Camf>> {
+        for e in &self.entries {
+            if self.section_id(e)? != SECC {
+                continue;
+            }
+            let mut r = Reader::at(&self.data, e.offset + 8);
+            let kind = r.u32()?;
+            let params = [r.u32()?, r.u32()?, r.u32()?, r.u32()?];
+            let body = self
+                .data
+                .get(e.offset + CAMF_HEADER_SIZE..e.offset + e.size)
+                .ok_or(Error::Truncated)?;
+            return camf::decode(kind, params, body).map(Some);
+        }
+        Ok(None)
+    }
+
     pub fn decode(&self) -> Result<Raw> {
         let h = self.raw_header()?;
         let quattro = h.format != FORMAT_MERRILL;
@@ -246,7 +274,9 @@ impl X3f {
         let mut off = 0usize;
         for i in 0..TRUE_PLANES {
             let end = off.checked_add(plane_size[i]).ok_or(Error::Truncated)?;
-            planes[i] = payload.get(off..end.min(payload.len())).ok_or(Error::Truncated)?;
+            planes[i] = payload
+                .get(off..end.min(payload.len()))
+                .ok_or(Error::Truncated)?;
             off += plane_size[i].div_ceil(16) * 16;
         }
 
@@ -254,9 +284,15 @@ impl X3f {
             let (w, h_) = (h.columns, h.rows);
             let mut rgb = vec![0u16; w * h_ * 3];
             for c in 0..3 {
-                decode_plane(planes[c], &tree, seed[c], w, h_, w, |idx, v| rgb[idx * 3 + c] = v)?;
+                decode_plane(planes[c], &tree, seed[c], w, h_, w, |idx, v| {
+                    rgb[idx * 3 + c] = v
+                })?;
             }
-            return Ok(Raw::Merrill { width: w, height: h_, rgb });
+            return Ok(Raw::Merrill {
+                width: w,
+                height: h_,
+                rgb,
+            });
         }
 
         let (lw, lh) = plane_dims[0];
@@ -265,19 +301,34 @@ impl X3f {
             let mut low = vec![0u16; lw * lh * 3];
             for c in 0..2 {
                 let (cols, rows) = plane_dims[c];
-                decode_plane(planes[c], &tree, seed[c], cols, rows, lw, |idx, v| low[idx * 3 + c] = v)?;
+                decode_plane(planes[c], &tree, seed[c], cols, rows, lw, |idx, v| {
+                    low[idx * 3 + c] = v
+                })?;
             }
             let mut top = vec![0u16; tw * th];
             decode_plane(planes[2], &tree, seed[2], tw, th, tw, |idx, v| top[idx] = v)?;
-            Ok(Raw::Quattro { low_width: lw, low_height: lh, low, top_width: tw, top_height: th, top })
+            Ok(Raw::Quattro {
+                low_width: lw,
+                low_height: lh,
+                low,
+                top_width: tw,
+                top_height: th,
+                top,
+            })
         } else if lh == h.rows {
             // Binned Quattro: all three layers have the same size.
             let mut rgb = vec![0u16; lw * lh * 3];
             for c in 0..3 {
                 let (cols, rows) = plane_dims[c];
-                decode_plane(planes[c], &tree, seed[c], cols, rows, lw, |idx, v| rgb[idx * 3 + c] = v)?;
+                decode_plane(planes[c], &tree, seed[c], cols, rows, lw, |idx, v| {
+                    rgb[idx * 3 + c] = v
+                })?;
             }
-            Ok(Raw::Merrill { width: lw, height: lh, rgb })
+            Ok(Raw::Merrill {
+                width: lw,
+                height: lh,
+                rgb,
+            })
         } else {
             Err(Error::Corrupt("unknown Quattro layer size"))
         }
@@ -285,7 +336,7 @@ impl X3f {
 }
 
 /// Binary tree over the TRUE Huffman table. Leaf value = number of difference bits.
-struct HuffTree {
+pub(crate) struct HuffTree {
     nodes: Vec<[u16; 2]>,
     leaf: Vec<u8>,
 }
@@ -293,14 +344,14 @@ struct HuffTree {
 const NONE: u16 = u16::MAX;
 
 impl HuffTree {
-    fn read(r: &mut Reader) -> Result<HuffTree> {
-        let mut t = HuffTree { nodes: vec![[NONE, NONE]], leaf: vec![NONE as u8] };
-        for i in 0..=255u32 {
-            let size = r.u8()? as u32;
-            let code = r.u8()? as u32;
-            if size == 0 {
-                break;
-            }
+    /// Builds the tree from `(code_size, code)` pairs; the leaf value is the pair's index.
+    pub(crate) fn from_pairs(pairs: impl Iterator<Item = (u8, u8)>) -> Result<HuffTree> {
+        let mut t = HuffTree {
+            nodes: vec![[NONE, NONE]],
+            leaf: vec![NONE as u8],
+        };
+        for (i, (size, code)) in pairs.enumerate() {
+            let (size, code) = (size as u32, code as u32);
             if size > 8 {
                 return Err(Error::Corrupt("huffman code too long"));
             }
@@ -319,6 +370,63 @@ impl HuffTree {
         }
         Ok(t)
     }
+
+    /// Reads the table stored in an image section: pairs up to a zero code size.
+    fn read(r: &mut Reader) -> Result<HuffTree> {
+        let mut pairs = Vec::new();
+        while pairs.len() < 256 {
+            let size = r.u8()?;
+            let code = r.u8()?;
+            if size == 0 {
+                break;
+            }
+            pairs.push((size, code));
+        }
+        HuffTree::from_pairs(pairs.into_iter())
+    }
+}
+
+/// MSB-first bit reader; reads past the end yield zero bits.
+pub(crate) struct Bits<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Bits<'a> {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
+        Bits { data, pos: 0 }
+    }
+
+    fn bit(&mut self) -> u8 {
+        let byte = self.data.get(self.pos >> 3).copied().unwrap_or(0);
+        let b = (byte >> (7 - (self.pos & 7))) & 1;
+        self.pos += 1;
+        b
+    }
+
+    /// One TRUE difference value: Huffman-coded bit count, then that many raw bits.
+    pub(crate) fn diff(&mut self, tree: &HuffTree) -> Result<i32> {
+        let mut n = 0usize;
+        while tree.nodes[n] != [NONE, NONE] {
+            n = tree.nodes[n][self.bit() as usize] as usize;
+            if n == NONE as usize {
+                return Err(Error::Corrupt("unexpected huffman bit"));
+            }
+        }
+        let nbits = tree.leaf[n];
+        if nbits == 0 || nbits == NONE as u8 {
+            return Ok(0);
+        }
+        let first = self.bit() as i32;
+        let mut d = first;
+        for _ in 1..nbits {
+            d = (d << 1) + self.bit() as i32;
+        }
+        if first == 0 {
+            d -= (1 << nbits) - 1;
+        }
+        Ok(d)
+    }
 }
 
 /// Decode one TRUE plane. `emit(index, value)` receives the pixel index within a row-major
@@ -332,13 +440,7 @@ fn decode_plane(
     stride: usize,
     mut emit: impl FnMut(usize, u16),
 ) -> Result<()> {
-    let mut pos = 0usize; // bit position
-    let mut bit = || -> u8 {
-        let byte = data.get(pos >> 3).copied().unwrap_or(0);
-        let b = (byte >> (7 - (pos & 7))) & 1;
-        pos += 1;
-        b
-    };
+    let mut bits = Bits::new(data);
 
     let mut row_start = [[seed; 2]; 2];
     for row in 0..rows {
@@ -347,29 +449,13 @@ fn decode_plane(
         for col in 0..cols {
             let odd_col = col & 1;
 
-            let mut n = 0usize;
-            while tree.nodes[n] != [NONE, NONE] {
-                n = tree.nodes[n][bit() as usize] as usize;
-                if n == NONE as usize {
-                    return Err(Error::Corrupt("unexpected huffman bit"));
-                }
-            }
-            let nbits = tree.leaf[n];
-            let diff = if nbits == 0 || nbits == NONE as u8 {
-                0
-            } else {
-                let first = bit() as i32;
-                let mut d = first;
-                for _ in 1..nbits {
-                    d = (d << 1) + bit() as i32;
-                }
-                if first == 0 {
-                    d -= (1 << nbits) - 1;
-                }
-                d
-            };
+            let diff = bits.diff(tree)?;
 
-            let prev = if col < 2 { row_start[odd_row][odd_col] } else { acc[odd_col] };
+            let prev = if col < 2 {
+                row_start[odd_row][odd_col]
+            } else {
+                acc[odd_col]
+            };
             let value = prev + diff;
             acc[odd_col] = value;
             if col < 2 {
