@@ -55,6 +55,10 @@ cargo test                  # コアライブラリのテスト
 dp Merrill は全ピクセル一致、dp Quattro は最上層が全ピクセル一致、下 2 層は独立に計算した双一次補間と一致しました。
 sd Quattro は参照実装が読み込めないため、画像として破綻していないことを目視で確認しています。
 
+## ライセンス
+
+MIT License([LICENSE](LICENSE))。
+
 ## 謝辞
 
 X3F の構造と圧縮方式は、Roland Karlsson 氏らの [x3f_tools](https://github.com/Kalpanika/x3f)(BSD スタイルライセンス)
