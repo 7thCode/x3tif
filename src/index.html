@@ -10,6 +10,9 @@
   #drop { flex: 1; min-height: 90px; display: flex; align-items: center; justify-content: center; text-align: center;
           border: 2px dashed #8888; border-radius: 12px; color: #888; transition: .15s; }
   body.over #drop { border-color: #3b82f6; color: #3b82f6; background: #3b82f622; }
+  #mode { display: flex; gap: 14px; font-size: 12px; justify-content: center; }
+  #mode label { cursor: pointer; }
+  #mode small { color: #888; }
   ul { list-style: none; margin: 0; padding: 0; max-height: 45vh; overflow: auto; font-size: 12px; }
   li { padding: 3px 0; display: flex; gap: 6px; }
   li .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
@@ -18,6 +21,10 @@
 </head>
 <body>
   <div id="drop">X3F ファイルをここにドロップ<br>→ 16bit TIFF に変換(同じフォルダに保存)</div>
+  <div id="mode">
+    <label><input type="radio" name="mode" value="raw" checked> 生データ <small>(リニア・無加工)</small></label>
+    <label><input type="radio" name="mode" value="developed"> 見たまま <small>(WB・色・sRGB)</small></label>
+  </div>
   <ul id="log"></ul>
 <script>
   const { listen } = window.__TAURI__.event;
@@ -38,10 +45,11 @@
   let queue = Promise.resolve();
   function enqueue(path) {
     const li = row(path);
+    const developed = document.querySelector('input[name=mode]:checked').value === 'developed';
     queue = queue.then(async () => {
       const state = li.querySelector('.state');
       try {
-        const out = await invoke('convert', { path });
+        const out = await invoke('convert', { path, developed });
         li.className = 'ok'; state.textContent = '→ ' + base(out);
       } catch (e) {
         li.className = 'err'; state.textContent = String(e);

@@ -3,6 +3,7 @@ use std::{
     io::BufWriter,
     path::{Path, PathBuf},
 };
+use x3tif_core::develop::Mode;
 
 /// `<dir>/<stem>.tif`, or `<stem>-1.tif`, `<stem>-2.tif`... if that already exists.
 fn output_path(input: &Path) -> PathBuf {
@@ -21,7 +22,7 @@ fn output_path(input: &Path) -> PathBuf {
         .expect("unbounded range")
 }
 
-fn convert_file(input: &Path) -> Result<PathBuf, String> {
+fn convert_file(input: &Path, mode: Mode) -> Result<PathBuf, String> {
     let is_x3f = input
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("x3f"));
@@ -33,7 +34,7 @@ fn convert_file(input: &Path) -> Result<PathBuf, String> {
     let tmp = out.with_extension("tif.part");
     let result = (|| {
         let mut w = BufWriter::new(File::create(&tmp).map_err(|e| format!("書き込めません: {e}"))?);
-        x3tif_core::convert::x3f_to_tiff(data, &mut w).map_err(|e| e.to_string())?;
+        x3tif_core::convert::x3f_to_tiff(data, &mut w, mode).map_err(|e| e.to_string())?;
         std::io::Write::flush(&mut w).map_err(|e| format!("書き込めません: {e}"))?;
         drop(w);
         fs::rename(&tmp, &out).map_err(|e| format!("書き込めません: {e}"))
@@ -45,8 +46,13 @@ fn convert_file(input: &Path) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-async fn convert(path: String) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || convert_file(Path::new(&path)))
+async fn convert(path: String, developed: bool) -> Result<String, String> {
+    let mode = if developed {
+        Mode::Developed
+    } else {
+        Mode::Raw
+    };
+    tauri::async_runtime::spawn_blocking(move || convert_file(Path::new(&path), mode))
         .await
         .map_err(|e| e.to_string())?
         .map(|p| p.to_string_lossy().into_owned())
@@ -87,8 +93,8 @@ mod tests {
         let d = temp_dir("bad");
         let bad = d.join("bad.x3f");
         fs::write(&bad, vec![0u8; 64]).unwrap();
-        assert!(convert_file(&bad).is_err());
-        assert!(convert_file(&d.join("note.txt")).is_err());
+        assert!(convert_file(&bad, Mode::Raw).is_err());
+        assert!(convert_file(&d.join("note.txt"), Mode::Raw).is_err());
         let left: Vec<_> = fs::read_dir(&d)
             .unwrap()
             .map(|e| e.unwrap().file_name())
@@ -107,12 +113,15 @@ mod tests {
         let input = d.join("sample.x3f");
         fs::copy(sample, &input).unwrap();
 
-        let out = convert_file(&input).unwrap();
+        let out = convert_file(&input, Mode::Raw).unwrap();
         assert_eq!(out, d.join("sample.tif"));
         let head = fs::read(&out).unwrap();
         assert_eq!(&head[..4], b"II*\0");
         // A second conversion must not overwrite the first result.
-        assert_eq!(convert_file(&input).unwrap(), d.join("sample-1.tif"));
+        assert_eq!(
+            convert_file(&input, Mode::Raw).unwrap(),
+            d.join("sample-1.tif")
+        );
         assert!(!d.join("sample.tif.part").exists());
         fs::remove_dir_all(d).unwrap();
     }

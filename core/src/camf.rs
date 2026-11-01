@@ -19,7 +19,12 @@ const MAX_STORED_ELEMENTS: usize = 4096;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Text(String),
-    Matrix { dims: Vec<usize>, values: Vec<f64> },
+    Matrix {
+        dims: Vec<usize>,
+        values: Vec<f64>,
+    },
+    /// A named list mapping a key to another entry's name (e.g. white balance -> gain matrix).
+    Properties(Vec<(String, String)>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,6 +53,17 @@ impl Camf {
             .find(|e| e.name == name)
             .and_then(|e| match &e.value {
                 Value::Matrix { values, .. } if !values.is_empty() => Some(values.as_slice()),
+                _ => None,
+            })
+    }
+
+    /// Looks up `key` in the property list `list` (e.g. `WhiteBalanceGains` / `Sunlight`).
+    pub fn property(&self, list: &str, key: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|e| e.name == list)
+            .and_then(|e| match &e.value {
+                Value::Properties(p) => p.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()),
                 _ => None,
             })
     }
@@ -189,7 +205,8 @@ fn entries(data: &[u8]) -> Vec<Entry> {
         let value = match id {
             CMB_T => text(e, value_off as usize),
             CMB_M => matrix(e, value_off as usize),
-            _ => None, // property lists carry no values worth keeping
+            CMB_P => properties(e, value_off as usize),
+            _ => None,
         };
         if let Some(value) = value {
             out.push(Entry { name, value });
@@ -197,6 +214,22 @@ fn entries(data: &[u8]) -> Vec<Entry> {
         p += entry_size.max(20);
     }
     out
+}
+
+/// Property entry: count, base offset, then (name, value) string offsets relative to the base.
+fn properties(e: &[u8], at: usize) -> Option<Value> {
+    let num = u32_at(e, at)? as usize;
+    let base = u32_at(e, at + 4)? as usize;
+    if num > 4096 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(num);
+    for i in 0..num {
+        let n = u32_at(e, at + 8 + 8 * i)? as usize;
+        let v = u32_at(e, at + 8 + 8 * i + 4)? as usize;
+        out.push((cstr(e, base.checked_add(n)?), cstr(e, base.checked_add(v)?)));
+    }
+    Some(Value::Properties(out))
 }
 
 fn text(e: &[u8], at: usize) -> Option<Value> {

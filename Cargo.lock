@@ -4075,7 +4075,7 @@ dependencies = [
 
 [[package]]
 name = "x3tif"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "tauri",
  "tauri-build",
@@ -4084,7 +4084,7 @@ dependencies = [
 
 [[package]]
 name = "x3tif-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "miniz_oxide 0.9.1",
 ]
