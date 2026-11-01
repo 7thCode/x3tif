@@ -13,9 +13,18 @@ pub struct Metadata {
     pub datetime: Option<String>,
     /// TIFF Orientation tag value, 1..=8.
     pub orientation: Option<u16>,
+    pub compression: Compression,
     pub exif: Exif,
     /// Raw XMP packet (tag 700).
     pub xmp: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Compression {
+    #[default]
+    None,
+    /// Adobe Deflate (zlib stream) with horizontal differencing. Lossless.
+    Deflate,
 }
 
 /// Exposure data stored in the EXIF sub-IFD. Rationals are (numerator, denominator).
@@ -145,6 +154,9 @@ fn serialize_ifd(tags: &[Tag], base: usize) -> Vec<u8> {
     out
 }
 
+/// Deflate effort (miniz_oxide levels 0-10).
+const DEFLATE_LEVEL: u8 = 3;
+
 /// Writes a 16 bit RGB TIFF. `fill_row(y, buf)` must fill `buf` (width*3 samples) for row `y`.
 pub fn write_rgb16<W: Write>(
     out: &mut W,
@@ -161,10 +173,45 @@ pub fn write_rgb16<W: Write>(
             "image too large for classic TIFF",
         )
     };
-    let total = row_bytes
+    row_bytes
         .checked_mul(height)
         .filter(|&t| t < u32::MAX as usize - (1 << 20))
         .ok_or_else(too_large)?;
+    let deflate = meta.compression == Compression::Deflate;
+
+    // One strip = ROWS_PER_STRIP rows. Deflate strips use horizontal differencing (Predictor 2)
+    // per row; they are compressed up front because the IFD records their sizes.
+    let samples = width * 3;
+    let mut row = vec![0u16; samples];
+    let mut encode_strip = |s: usize| -> Vec<u8> {
+        let first = s * ROWS_PER_STRIP;
+        let rows = ROWS_PER_STRIP.min(height - first);
+        let mut bytes = Vec::with_capacity(rows * row_bytes);
+        for y in first..first + rows {
+            fill_row(y, &mut row);
+            if deflate {
+                for i in (3..samples).rev() {
+                    row[i] = row[i].wrapping_sub(row[i - 3]);
+                }
+            }
+            for v in &row {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        if deflate {
+            miniz_oxide::deflate::compress_to_vec_zlib(&bytes, DEFLATE_LEVEL)
+        } else {
+            bytes
+        }
+    };
+    let prepared: Option<Vec<Vec<u8>>> =
+        deflate.then(|| (0..strips).map(&mut encode_strip).collect());
+    let counts: Vec<usize> = match &prepared {
+        Some(p) => p.iter().map(Vec::len).collect(),
+        None => (0..strips)
+            .map(|s| ROWS_PER_STRIP.min(height - s * ROWS_PER_STRIP) * row_bytes)
+            .collect(),
+    };
 
     // Layout: header | EXIF IFD (optional) | IFD0 | pixel data.
     let exif_block = if meta.exif.is_empty() {
@@ -207,7 +254,7 @@ pub fn write_rgb16<W: Write>(
                 .flat_map(|v| v.to_le_bytes())
                 .collect(),
         ),
-        short(259, 1),
+        short(259, if deflate { 8 } else { 1 }),
         short(262, 2),
     ];
     if let Some(s) = &meta.make {
@@ -227,11 +274,9 @@ pub fn write_rgb16<W: Write>(
         279,
         LONG,
         strips as u32,
-        (0..strips)
-            .flat_map(|s| {
-                let rows = ROWS_PER_STRIP.min(height - s * ROWS_PER_STRIP);
-                ((rows * row_bytes) as u32).to_le_bytes()
-            })
+        counts
+            .iter()
+            .flat_map(|&c| (c as u32).to_le_bytes())
             .collect(),
     ));
     tags.push(short(284, 1));
@@ -241,6 +286,9 @@ pub fn write_rgb16<W: Write>(
     if let Some(s) = &meta.datetime {
         tags.push(ascii(306, s));
     }
+    if deflate {
+        tags.push(short(317, 2)); // Predictor: horizontal differencing
+    }
     if let Some(x) = &meta.xmp {
         tags.push(extra(700, UNDEFINED, x.len() as u32, x.clone()));
     }
@@ -249,13 +297,14 @@ pub fn write_rgb16<W: Write>(
     }
 
     let pixel_start = ifd0_at + serialize_ifd(&tags, ifd0_at).len();
-    if pixel_start + total > u32::MAX as usize {
+    if pixel_start + counts.iter().sum::<usize>() > u32::MAX as usize {
         return Err(too_large());
     }
     if let Value::Extra(b) = &mut tags[strip_offsets_at].value {
-        for s in 0..strips {
-            let off = (pixel_start + s * ROWS_PER_STRIP * row_bytes) as u32;
-            b[s * 4..s * 4 + 4].copy_from_slice(&off.to_le_bytes());
+        let mut off = pixel_start;
+        for (s, &c) in counts.iter().enumerate() {
+            b[s * 4..s * 4 + 4].copy_from_slice(&(off as u32).to_le_bytes());
+            off += c;
         }
     }
 
@@ -266,14 +315,11 @@ pub fn write_rgb16<W: Write>(
     }
     out.write_all(&serialize_ifd(&tags, ifd0_at))?;
 
-    let mut row = vec![0u16; width * 3];
-    let mut bytes = vec![0u8; row_bytes];
-    for y in 0..height {
-        fill_row(y, &mut row);
-        for (dst, v) in bytes.chunks_exact_mut(2).zip(&row) {
-            dst.copy_from_slice(&v.to_le_bytes());
+    for s in 0..strips {
+        match &prepared {
+            Some(p) => out.write_all(&p[s])?,
+            None => out.write_all(&encode_strip(s))?,
         }
-        out.write_all(&bytes)?;
     }
     Ok(())
 }
@@ -360,5 +406,82 @@ mod tests {
         assert_eq!((u32_at(&out, rat), u32_at(&out, rat + 4)), (28, 5));
         assert_eq!(u16_at(&out, exif_at + 2 + 12), 34855); // ISOSpeedRatings
         assert_eq!(u16_at(&out, exif_at + 2 + 12 + 8), 200);
+    }
+
+    fn strips_of(out: &[u8]) -> (Vec<(usize, usize)>, std::collections::HashMap<u16, u32>) {
+        let ifd = u32_at(out, 4) as usize;
+        let n = u16_at(out, ifd) as usize;
+        let mut tags = std::collections::HashMap::new();
+        for i in 0..n {
+            let e = ifd + 2 + i * 12;
+            tags.insert(u16_at(out, e), u32_at(out, e + 8));
+        }
+        let count = u32_at(
+            out,
+            ifd + 2
+                + (0..n)
+                    .position(|i| u16_at(out, ifd + 2 + i * 12) == 273)
+                    .unwrap()
+                    * 12
+                + 4,
+        ) as usize;
+        let (offs, lens) = (tags[&273] as usize, tags[&279] as usize);
+        let strips = (0..count)
+            .map(|s| {
+                (
+                    u32_at(out, offs + s * 4) as usize,
+                    u32_at(out, lens + s * 4) as usize,
+                )
+            })
+            .collect();
+        (strips, tags)
+    }
+
+    #[test]
+    fn deflate_strips_decode_back_to_the_original_pixels() {
+        // Noisy, wrap-around-prone data so the predictor's 16 bit wrapping is exercised.
+        let (w, h) = (37, 50);
+        let pixel = |y: usize, i: usize| ((y * 7919 + i * 104729) % 65536) as u16;
+        let mut out = Vec::new();
+        let meta = Metadata {
+            compression: Compression::Deflate,
+            ..Default::default()
+        };
+        write_rgb16(&mut out, w, h, &meta, |y, row| {
+            for (i, v) in row.iter_mut().enumerate() {
+                *v = pixel(y, i);
+            }
+        })
+        .unwrap();
+
+        let (strips, tags) = strips_of(&out);
+        assert_eq!(tags[&259], 8); // Compression: Deflate
+        assert_eq!(tags[&317], 2); // Predictor: horizontal differencing
+        let mut y = 0;
+        for (off, len) in strips {
+            let raw = miniz_oxide::inflate::decompress_to_vec_zlib(&out[off..off + len]).unwrap();
+            for line in raw.chunks_exact(w * 6) {
+                let mut prev = [0u16; 3];
+                for (x, px) in line.chunks_exact(6).enumerate() {
+                    for c in 0..3 {
+                        let d = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                        let v = if x == 0 { d } else { d.wrapping_add(prev[c]) };
+                        prev[c] = v;
+                        assert_eq!(v, pixel(y, x * 3 + c), "x={x} y={y} c={c}");
+                    }
+                }
+                y += 1;
+            }
+        }
+        assert_eq!(y, h);
+    }
+
+    #[test]
+    fn uncompressed_is_still_the_default() {
+        let mut out = Vec::new();
+        write_rgb16(&mut out, 2, 2, &Metadata::default(), |_, row| row.fill(1)).unwrap();
+        let (_, tags) = strips_of(&out);
+        assert_eq!(tags[&259], 1);
+        assert!(!tags.contains_key(&317));
     }
 }
