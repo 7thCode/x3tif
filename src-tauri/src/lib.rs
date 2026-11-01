@@ -6,7 +6,10 @@ use std::{
 
 /// `<dir>/<stem>.tif`, or `<stem>-1.tif`, `<stem>-2.tif`... if that already exists.
 fn output_path(input: &Path) -> PathBuf {
-    let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let stem = input
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let dir = input.parent().unwrap_or_else(|| Path::new("."));
     let first = dir.join(format!("{stem}.tif"));
     if !first.exists() {
@@ -86,8 +89,31 @@ mod tests {
         fs::write(&bad, vec![0u8; 64]).unwrap();
         assert!(convert_file(&bad).is_err());
         assert!(convert_file(&d.join("note.txt")).is_err());
-        let left: Vec<_> = fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name()).collect();
+        let left: Vec<_> = fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
         assert_eq!(left, vec![std::ffi::OsString::from("bad.x3f")]);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    /// Runs only when `X3TIF_SAMPLE` points at a real X3F file (sample photos are not in the repo).
+    #[test]
+    fn converts_a_real_sample_when_provided() {
+        let Some(sample) = std::env::var_os("X3TIF_SAMPLE") else {
+            return;
+        };
+        let d = temp_dir("real");
+        let input = d.join("sample.x3f");
+        fs::copy(sample, &input).unwrap();
+
+        let out = convert_file(&input).unwrap();
+        assert_eq!(out, d.join("sample.tif"));
+        let head = fs::read(&out).unwrap();
+        assert_eq!(&head[..4], b"II*\0");
+        // A second conversion must not overwrite the first result.
+        assert_eq!(convert_file(&input).unwrap(), d.join("sample-1.tif"));
+        assert!(!d.join("sample.tif.part").exists());
         fs::remove_dir_all(d).unwrap();
     }
 }
