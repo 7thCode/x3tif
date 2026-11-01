@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   build:
-    uses: 7thCode/actions-templates/.github/workflows/multiplatform-release.yml@main
+    uses: 7thCode/actions-templates/.github/workflows/tauri-multiplatform-release.yml@main
     with:
       upload_to_release_tag: ${{ inputs.upload_to_release }}
     secrets:

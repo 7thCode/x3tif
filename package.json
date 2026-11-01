@@ -4,6 +4,7 @@
   "private": true,
   "description": "Sigma Foveon X3F to 16-bit TIFF converter",
   "scripts": {
+    "tauri": "tauri",
     "dev": "tauri dev",
     "build": "tauri build"
   },
