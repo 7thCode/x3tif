@@ -28,6 +28,57 @@ pub enum Exposure {
 /// Exposure compensation limits (EV), for both the automatic fit and explicit values.
 pub const EV_RANGE: (f64, f64) = (-4.0, 4.0);
 
+/// Quattro low-resolution layers contain a regular grid of "highlight" pixels (CAMF
+/// `HighlightPixelsInfo`: first column, first row, column pitch, row pitch) that read about half
+/// of the true value. Left alone they show up as dotted vertical lines, so, as x3f_tools does,
+/// replace each by the mean of its horizontal and vertical neighbours (the grid is sparse enough
+/// that those are always ordinary pixels).
+pub fn repair_highlight_pixels(raw: &mut Raw, camf: &Camf) {
+    let Raw::Quattro {
+        low_width,
+        low_height,
+        low,
+        ..
+    } = raw
+    else {
+        return;
+    };
+    let Some(info) = camf.matrix("HighlightPixelsInfo").filter(|m| m.len() == 4) else {
+        return;
+    };
+    let [col0, row0, col_pitch, row_pitch] =
+        [info[0], info[1], info[2], info[3]].map(|v| v as usize);
+    if col_pitch < 2 || row_pitch < 2 {
+        return;
+    }
+    let (w, h) = (*low_width, *low_height);
+    for y in (row0..h).step_by(row_pitch) {
+        for x in (col0..w).step_by(col_pitch) {
+            let mut neighbours = Vec::with_capacity(4);
+            if x > 0 {
+                neighbours.push((x - 1, y));
+            }
+            if x + 1 < w {
+                neighbours.push((x + 1, y));
+            }
+            if y > 0 {
+                neighbours.push((x, y - 1));
+            }
+            if y + 1 < h {
+                neighbours.push((x, y + 1));
+            }
+            for c in 0..3 {
+                let sum: u32 = neighbours
+                    .iter()
+                    .map(|&(nx, ny)| low[(ny * w + nx) * 3 + c] as u32)
+                    .sum();
+                let n = neighbours.len() as u32;
+                low[(y * w + x) * 3 + c] = ((sum + n / 2) / n) as u16;
+            }
+        }
+    }
+}
+
 /// Sensor bit depth from CAMF (`ImageDepth`); 14 bit is what Quattro and 12 bit what Merrill report.
 fn image_depth(camf: &Camf) -> Option<u32> {
     camf.number("ImageDepth")
@@ -570,6 +621,39 @@ mod tests {
             },
         });
         c
+    }
+
+    #[test]
+    fn highlight_pixels_are_replaced_by_their_neighbours() {
+        // 4x4 low layer, all 100 except the grid pixel at (1, 1) which reads half.
+        let quattro = || {
+            let mut low = vec![100u16; 4 * 4 * 3];
+            for c in 0..3 {
+                low[(4 + 1) * 3 + c] = 50;
+            }
+            Raw::Quattro {
+                low_width: 4,
+                low_height: 4,
+                low,
+                top_width: 8,
+                top_height: 8,
+                top: vec![0; 64],
+            }
+        };
+        let pixel = |raw: &Raw| match raw {
+            Raw::Quattro { low, .. } => low[(4 + 1) * 3],
+            _ => unreachable!(),
+        };
+        let mut raw = quattro();
+        repair_highlight_pixels(
+            &mut raw,
+            &Camf(vec![m("HighlightPixelsInfo", &[1.0, 1.0, 2.0, 2.0])]),
+        );
+        assert_eq!(pixel(&raw), 100);
+        // Files without the entry are left alone.
+        let mut untouched = quattro();
+        repair_highlight_pixels(&mut untouched, &Camf::default());
+        assert_eq!(pixel(&untouched), 50);
     }
 
     #[test]
