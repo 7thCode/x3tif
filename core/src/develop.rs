@@ -37,6 +37,8 @@ pub struct Developer {
 }
 
 const CURVE_SIZE: usize = 4096;
+/// Normalised raw level where the highlight blend towards white begins.
+const CLIP_START: f64 = 0.9;
 
 fn srgb_encode(l: f64) -> f64 {
     if l <= 0.003_130_8 {
@@ -140,13 +142,25 @@ impl Developer {
             let n: [f64; 3] = std::array::from_fn(|c| {
                 ((px[c] as f64 - self.black[c]) / (self.white[c] - self.black[c])).max(0.0)
             });
-            for (c, out) in px.iter_mut().enumerate() {
+            let mut lin: [f64; 3] = std::array::from_fn(|c| {
                 let m = &self.matrix[c];
-                let lin = (m[0] * n[0] + m[1] * n[1] + m[2] * n[2]).clamp(0.0, 1.0);
-                let pos = lin * CURVE_SIZE as f64;
+                (m[0] * n[0] + m[1] * n[1] + m[2] * n[2]).clamp(0.0, 1.0)
+            });
+            // A saturated channel under-reports its colour, which turns bright skies yellow-green.
+            // Blend those pixels towards white as the brightest channel nears saturation.
+            let peak = n.iter().cloned().fold(0.0, f64::max);
+            let t = ((peak - CLIP_START) / (1.0 - CLIP_START)).clamp(0.0, 1.0);
+            if t > 0.0 {
+                let top = lin.iter().cloned().fold(0.0, f64::max);
+                for l in &mut lin {
+                    *l += (top - *l) * t;
+                }
+            }
+            for (out, l) in px.iter_mut().zip(lin) {
+                let pos = l * CURVE_SIZE as f64;
                 let i = (pos as usize).min(CURVE_SIZE - 1);
-                let t = pos - i as f64;
-                *out = (self.curve[i] * (1.0 - t) + self.curve[i + 1] * t).round() as u16;
+                let f = pos - i as f64;
+                *out = (self.curve[i] * (1.0 - f) + self.curve[i + 1] * f).round() as u16;
             }
         }
     }
@@ -160,24 +174,26 @@ fn black_levels(raw: &Raw, camf: &Camf) -> Result<[f64; 3], Error> {
             .filter(|m| m.len() == 4)
             .map(|m| [m[0], m[1], m[2], m[3]])
     };
-    let mut areas: Vec<[f64; 4]> = Vec::new();
+    // (is a rectangle, area) -- the column ranges are only trusted if they agree with the
+    // rectangles: some files (DP1 Merrill) list a column range that is not actually shielded.
+    let mut areas: Vec<(bool, [f64; 4])> = Vec::new();
     // The bottom strip is specified incorrectly by sd Quattro H firmware.
     let skip_bottom = camf.number("CAMERAID") == Some(41.0);
-    areas.extend(rect("DarkShieldTop"));
+    areas.extend(rect("DarkShieldTop").map(|a| (true, a)));
     if !skip_bottom {
-        areas.extend(rect("DarkShieldBottom"));
+        areas.extend(rect("DarkShieldBottom").map(|a| (true, a)));
     }
     if let Some(c) = camf.matrix("DarkShieldColRange").filter(|m| m.len() == 4) {
-        areas.push([c[0], 0.0, c[1], f64::MAX]);
-        areas.push([c[2], 0.0, c[3], f64::MAX]);
+        areas.push((false, [c[0], 0.0, c[1], f64::MAX]));
+        areas.push((false, [c[2], 0.0, c[3], f64::MAX]));
     }
     if areas.is_empty() {
         return Err(Error::MissingCalibration("DarkShield"));
     }
 
-    // (width, height, scale of the area coordinates, sample accessor) per channel.
     let mut out = [0.0; 3];
     for (c, slot) in out.iter_mut().enumerate() {
+        // Area coordinates are in full-resolution pixels; the low Quattro layers are half size.
         let (w, h, scale) = match raw {
             Raw::Merrill { width, height, .. } => (*width, *height, 1.0),
             Raw::Quattro {
@@ -194,23 +210,39 @@ fn black_levels(raw: &Raw, camf: &Camf) -> Result<[f64; 3], Error> {
                 }
             }
         };
-        let (mut sum, mut count) = (0u64, 0u64);
-        for a in &areas {
+        // (is a rectangle, sum, count) per area.
+        let mut stats: Vec<(bool, u64, u64)> = Vec::new();
+        for (is_rect, a) in &areas {
             let x0 = (a[0] * scale) as usize;
             let y0 = (a[1] * scale) as usize;
             let x1 = ((a[2] * scale).min(w as f64 - 1.0)) as usize;
             let y1 = ((a[3] * scale).min(h as f64 - 1.0)) as usize;
-            for y in y0..=y1.min(h - 1) {
+            let (mut sum, mut count) = (0u64, 0u64);
+            for y in y0..=y1 {
                 for x in x0..=x1 {
                     sum += sample(raw, c, x, y) as u64;
                     count += 1;
                 }
             }
+            if count > 0 {
+                stats.push((*is_rect, sum, count));
+            }
         }
-        if count == 0 {
+        let pooled = |keep: &dyn Fn(&(bool, u64, u64)) -> bool| {
+            let (s, n) = stats
+                .iter()
+                .filter(|a| keep(a))
+                .fold((0, 0), |t, a| (t.0 + a.1, t.1 + a.2));
+            (n > 0).then(|| s as f64 / n as f64)
+        };
+        let reference = pooled(&|a| a.0).or_else(|| pooled(&|_| true));
+        let Some(reference) = reference else {
             return Err(Error::MissingCalibration("DarkShield"));
-        }
-        *slot = sum as f64 / count as f64;
+        };
+        let tolerance = reference * 0.01 + 2.0;
+        let trusted =
+            |a: &(bool, u64, u64)| a.0 || (a.1 as f64 / a.2 as f64 - reference).abs() <= tolerance;
+        *slot = pooled(&trusted).unwrap_or(reference);
     }
     Ok(out)
 }
