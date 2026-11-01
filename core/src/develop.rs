@@ -269,12 +269,13 @@ fn wb_from_code(code: u32) -> &'static str {
 const MERRILL_RED_TRIM: f64 = 1.04;
 
 /// The table's gains are relative to a green gain of about 0.855, while the per-white-balance
-/// `WBGain` entries are relative to 1. Found by comparing with those entries (about 1.16) and then
-/// tuned: red against the camera's own JPEG (neutral areas of dp0 Quattro shots within 3%; 1.0
-/// would be off by 50%), blue against Photo Pro's TIFF output. Four dp0 Quattro files (all at
-/// 5000K) agreed on red 1.18-1.20 and blue 1.10-1.12; a single 1.17 left blue 6-13/255 too high.
-const COLOR_TEMP_RED_SCALE: f64 = 1.18;
-const COLOR_TEMP_BLUE_SCALE: f64 = 1.12;
+/// `WBGain` entries are relative to 1. Found by comparing with those entries (about 1.16), then
+/// calibrated on the developed output itself against Photo Pro's TIFF: four dp0 Quattro files
+/// (all at 5000K) agree on red 1.18-1.19 and blue 1.16-1.19 (a single 1.17 left red about 4/255
+/// low). Calibrate on the finished output, not on a raw-mode TIFF: that one lacks the highlight
+/// pixel repair, and the colour matrix amplifies a few percent of green into ~20% of blue.
+const COLOR_TEMP_RED_SCALE: f64 = 1.185;
+const COLOR_TEMP_BLUE_SCALE: f64 = 1.17;
 
 /// White balance by colour temperature (Quattro "ColorTemp" setting): the gains and colour
 /// matrix are interpolated from `ColorTempTableInfo` at the file's `ColorTempValue`. The table has
