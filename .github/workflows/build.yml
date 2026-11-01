@@ -1,0 +1,23 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      upload_to_release:
+        description: 'Existing release tag to upload built assets to (optional; leave empty to just upload workflow artifacts)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: 7thCode/actions-templates/.github/workflows/multiplatform-release.yml@main
+    with:
+      upload_to_release_tag: ${{ inputs.upload_to_release }}
+    secrets:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
