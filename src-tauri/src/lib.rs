@@ -3,7 +3,7 @@ use std::{
     io::BufWriter,
     path::{Path, PathBuf},
 };
-use x3tif_core::develop::Mode;
+use x3tif_core::develop::{Exposure, Mode};
 
 /// `<dir>/<stem>.tif`, or `<stem>-1.tif`, `<stem>-2.tif`... if that already exists.
 fn output_path(input: &Path) -> PathBuf {
@@ -46,11 +46,12 @@ fn convert_file(input: &Path, mode: Mode) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-async fn convert(path: String, developed: bool) -> Result<String, String> {
-    let mode = if developed {
-        Mode::Developed
-    } else {
-        Mode::Raw
+async fn convert(path: String, developed: bool, exposure: Option<f64>) -> Result<String, String> {
+    // `exposure` is an EV; none means "match the camera's preview".
+    let mode = match (developed, exposure) {
+        (false, _) => Mode::Raw,
+        (true, Some(ev)) => Mode::Developed(Exposure::Ev(ev)),
+        (true, None) => Mode::Developed(Exposure::Auto),
     };
     tauri::async_runtime::spawn_blocking(move || convert_file(Path::new(&path), mode))
         .await

@@ -1,7 +1,7 @@
 //! X3F → 16 bit TIFF conversion, either as raw sensor values or developed to sRGB.
 
 use crate::camf::{Camf, Value};
-use crate::develop::{self, Developer, Mode};
+use crate::develop::{self, Developer, Exposure, Mode};
 use crate::exif::{self, PreviewExif};
 use crate::tiff::{self, Compression, Exif, Metadata};
 use crate::x3f::{Error, Properties, Raw, X3f};
@@ -48,13 +48,34 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W, mode: Mode) -> Result<(
         .unwrap_or_default();
     let raw = x3f.decode()?;
 
-    // Per-row finishing step: shift to the 16 bit range (raw) or develop to sRGB.
+    let (full_width, full_height) = match &raw {
+        Raw::Merrill { width, height, .. } => (*width, *height),
+        // See the Quattro branch below: the output covers what the low layers cover.
+        Raw::Quattro {
+            low_width,
+            low_height,
+            top_width,
+            top_height,
+            ..
+        } => (
+            (*top_width).min(2 * low_width),
+            (*top_height).min(2 * low_height),
+        ),
+    };
+    let area = active_area(&camf, full_width, full_height);
+
+    // Per-row finishing step: shift to the 16 bit range (raw) or develop.
+    let mut ev = [0.0; 3];
     let developer = match mode {
-        Mode::Developed => Some(Developer::new(
-            &raw,
-            &camf,
-            x3f.header_white_balance().as_deref(),
-        )?),
+        Mode::Developed(exposure) => {
+            let mut d = Developer::new(&raw, &camf, x3f.header_white_balance().as_deref())?;
+            ev = match exposure {
+                Exposure::Ev(ev) => [ev; 3],
+                Exposure::Auto => auto_exposure(&x3f, &d, &raw, &area),
+            };
+            d.set_exposure_ev(ev);
+            Some(d)
+        }
         Mode::Raw => None,
     };
     let shift = develop::raw_shift(&camf);
@@ -70,14 +91,15 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W, mode: Mode) -> Result<(
     };
 
     let output = match (&developer, shift) {
-        (Some(d), _) => Output::Developed(d.white_balance.clone()),
+        (Some(d), _) => Output::Developed(d.white_balance.clone(), ev),
         (None, s) => Output::Raw(1 << s),
     };
     let meta = metadata(&props, &camf, &preview, &output);
     match raw {
-        Raw::Merrill { width, height, rgb } => {
-            tiff::write_rgb16(out, width, height, &meta, |y, row| {
-                row.copy_from_slice(&rgb[y * width * 3..(y + 1) * width * 3]);
+        Raw::Merrill { width, rgb, .. } => {
+            tiff::write_rgb16(out, area.width, area.height, &meta, |y, row| {
+                let at = ((y + area.y) * width + area.x) * 3;
+                row.copy_from_slice(&rgb[at..at + area.width * 3]);
                 finish(row);
             })?;
         }
@@ -95,9 +117,11 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W, mode: Mode) -> Result<(
             let height = top_height.min(2 * low_height);
             let xs = taps(width, low_width);
             let ys = taps(height, low_height);
-            tiff::write_rgb16(out, width, height, &meta, |y, row| {
+            tiff::write_rgb16(out, area.width, area.height, &meta, |y, row| {
+                let y = y + area.y;
                 let (y0, y1, wy) = ys[y];
-                for (x, px) in row.chunks_exact_mut(3).enumerate() {
+                for (i, px) in row.chunks_exact_mut(3).enumerate() {
+                    let x = i + area.x;
                     let (x0, x1, wx) = xs[x];
                     for c in 0..2 {
                         let at = |yy: usize, xx: usize| low[(yy * low_width + xx) * 3 + c] as u32;
@@ -115,12 +139,69 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W, mode: Mode) -> Result<(
     Ok(())
 }
 
+/// EV that makes the developed picture as bright as the camera's embedded JPEG preview (0 if the
+/// file has no decodable preview). One value for all channels: matching each channel's median
+/// to the preview as well overshoots (a saturated sky turns the whole picture violet).
+fn auto_exposure(x3f: &X3f, developer: &Developer, raw: &Raw, area: &Area) -> [f64; 3] {
+    let mut previews: Vec<&[u8]> = x3f.preview_jpegs().collect();
+    previews.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    let Some(target) = previews.into_iter().find_map(develop::jpeg_median_rgb) else {
+        return [0.0; 3];
+    };
+    let scene = developer.median_linear(raw, (area.x, area.y, area.width, area.height));
+    if scene.iter().any(|&s| s <= 0.0) {
+        return [0.0; 3];
+    }
+    // Luminance-weighted mean of the per-channel fits.
+    const LUMA: [f64; 3] = [0.2126, 0.7152, 0.0722];
+    let ev: f64 = (0..3)
+        .map(|c| LUMA[c] * Developer::exposure_for(scene[c], target[c]))
+        .sum();
+    [ev; 3]
+}
+
+/// The part of the decoded image that is actual picture.
+struct Area {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+/// CAMF `ActiveImageArea` (inclusive, in sensor coordinates) relative to the decoded image, which
+/// starts at the origin of `KeepImageArea`. Everything outside it is dark shield and margins.
+/// Falls back to the whole image if the file gives no usable area.
+fn active_area(camf: &Camf, width: usize, height: usize) -> Area {
+    let whole = Area {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let rect = |name: &str| camf.matrix(name).filter(|m| m.len() == 4);
+    let Some(active) = rect("ActiveImageArea") else {
+        return whole;
+    };
+    let (ox, oy) = rect("KeepImageArea").map_or((0.0, 0.0), |k| (k[0], k[1]));
+    let (x0, y0) = (active[0] - ox, active[1] - oy);
+    let (x1, y1) = (active[2] - ox, active[3] - oy);
+    if x0 < 0.0 || y0 < 0.0 || x1 < x0 || y1 < y0 || x1 >= width as f64 || y1 >= height as f64 {
+        return whole;
+    }
+    Area {
+        x: x0 as usize,
+        y: y0 as usize,
+        width: (x1 - x0) as usize + 1,
+        height: (y1 - y0) as usize + 1,
+    }
+}
+
 /// How the pixel values were produced; recorded in the XMP so later tools can undo the scaling.
 enum Output {
     /// Raw sensor values multiplied by this factor.
     Raw(u32),
     /// Developed with the named white balance.
-    Developed(String),
+    Developed(String, [f64; 3]),
 }
 
 /// For each full-resolution coordinate, the two neighbouring low-resolution samples and the
@@ -271,9 +352,12 @@ fn xmp(props: &Properties, camf: &Camf, output: &Output) -> Vec<u8> {
     let how = match output {
         // Divide the samples by RawScale to get the sensor's own values back.
         Output::Raw(scale) => format!("x3f:OutputMode=\"raw\" x3f:RawScale=\"{scale}\""),
-        Output::Developed(wb) => format!(
-            "x3f:OutputMode=\"developed\" x3f:ColorSpace=\"sRGB\" x3f:WhiteBalance=\"{}\"",
-            xml_escape(wb)
+        Output::Developed(wb, ev) => format!(
+            "x3f:OutputMode=\"developed\" x3f:ColorSpace=\"sRGB\" x3f:WhiteBalance=\"{}\" x3f:ExposureEV=\"{:.2},{:.2},{:.2}\"",
+            xml_escape(wb),
+            ev[0],
+            ev[1],
+            ev[2]
         ),
     };
     let mut s = format!(

@@ -13,6 +13,10 @@
   #mode { display: flex; gap: 14px; font-size: 12px; justify-content: center; }
   #mode label { cursor: pointer; }
   #mode small { color: #888; }
+  #exp { display: none; gap: 8px; font-size: 12px; justify-content: center; align-items: center; }
+  body.dev #exp { display: flex; }
+  #exp input[type=range] { width: 140px; }
+  #exp input:disabled { opacity: .4; }
   ul { list-style: none; margin: 0; padding: 0; max-height: 45vh; overflow: auto; font-size: 12px; }
   li { padding: 3px 0; display: flex; gap: 6px; }
   li .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
@@ -25,11 +29,23 @@
     <label><input type="radio" name="mode" value="raw" checked> 生データ <small>(リニア・無加工)</small></label>
     <label><input type="radio" name="mode" value="developed"> 見たまま <small>(WB・色・sRGB)</small></label>
   </div>
+  <div id="exp">
+    <label><input type="checkbox" id="auto" checked> 自動 <small>(プレビューに合わせる)</small></label>
+    <input type="range" id="ev" min="-4" max="4" step="0.1" value="0" disabled>
+    <span id="evv">+0.0 EV</span>
+  </div>
   <ul id="log"></ul>
 <script>
   const { listen } = window.__TAURI__.event;
   const { invoke } = window.__TAURI__.core;
   const log = document.getElementById('log');
+  const autoEv = document.getElementById('auto');
+  const ev = document.getElementById('ev');
+  const showEv = () => { document.getElementById('evv').textContent = (ev.value >= 0 ? '+' : '') + Number(ev.value).toFixed(1) + ' EV'; };
+  autoEv.onchange = () => { ev.disabled = autoEv.checked; };
+  ev.oninput = showEv;
+  document.querySelectorAll('input[name=mode]').forEach(r => r.onchange = () =>
+    document.body.classList.toggle('dev', document.querySelector('input[name=mode]:checked').value === 'developed'));
   const base = p => p.split(/[\\/]/).pop();
 
   function row(path) {
@@ -46,10 +62,11 @@
   function enqueue(path) {
     const li = row(path);
     const developed = document.querySelector('input[name=mode]:checked').value === 'developed';
+    const exposure = autoEv.checked ? null : Number(ev.value);
     queue = queue.then(async () => {
       const state = li.querySelector('.state');
       try {
-        const out = await invoke('convert', { path, developed });
+        const out = await invoke('convert', { path, developed, exposure });
         li.className = 'ok'; state.textContent = '→ ' + base(out);
       } catch (e) {
         li.className = 'err'; state.textContent = String(e);

@@ -1,18 +1,32 @@
 //! The two output looks.
 //!
 //! * `Raw`: sensor values untouched, only shifted up to fill the 16 bit range (lossless).
-//! * `Developed`: black level, white balance, colour matrix and the sRGB curve, using the
-//!   calibration stored in the file's CAMF block.
+//! * `Developed`: black level, white balance, colour matrix, exposure and a tone curve, using the
+//!   calibration stored in the file's CAMF block. The exposure defaults to whatever makes the
+//!   picture as bright as the camera's own embedded JPEG preview.
 
 use crate::camf::Camf;
 use crate::x3f::{Error, Raw};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Mode {
     #[default]
     Raw,
-    Developed,
+    Developed(Exposure),
 }
+
+/// Exposure compensation for the developed output.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Exposure {
+    /// Match the brightness of the embedded JPEG preview.
+    #[default]
+    Auto,
+    /// Fixed compensation in EV (stops).
+    Ev(f64),
+}
+
+/// Exposure compensation limits (EV), for both the automatic fit and explicit values.
+pub const EV_RANGE: (f64, f64) = (-4.0, 4.0);
 
 /// Sensor bit depth from CAMF (`ImageDepth`); 14 bit is what Quattro and 12 bit what Merrill report.
 fn image_depth(camf: &Camf) -> Option<u32> {
@@ -33,10 +47,22 @@ pub struct Developer {
     matrix: [[f64; 3]; 3],
     /// sRGB-encoded 16 bit value for evenly spaced linear inputs in 0..=1.
     curve: Vec<f64>,
+    /// Per-channel linear gain applied before the curve (2^EV).
+    gain: [f64; 3],
     pub white_balance: String,
 }
 
 const CURVE_SIZE: usize = 4096;
+/// Normalised raw level where the highlight blend towards white begins.
+const CLIP_START: f64 = 0.9;
+/// How far the S-shaped tone curve is mixed in (0 = plain sRGB).
+const TONE_STRENGTH: f64 = 0.5;
+
+/// sRGB encoding followed by a gentle S-curve, like the contrast a camera JPEG has.
+fn encode(l: f64) -> f64 {
+    let e = srgb_encode(l.clamp(0.0, 1.0));
+    e + TONE_STRENGTH * (e * e * (3.0 - 2.0 * e) - e)
+}
 
 fn srgb_encode(l: f64) -> f64 {
     if l <= 0.003_130_8 {
@@ -123,15 +149,59 @@ impl Developer {
             }
         }
         let curve = (0..=CURVE_SIZE)
-            .map(|i| srgb_encode(i as f64 / CURVE_SIZE as f64) * 65535.0)
+            .map(|i| encode(i as f64 / CURVE_SIZE as f64) * 65535.0)
             .collect();
         Ok(Developer {
             black,
             white: [max; 3],
             matrix,
             curve,
+            gain: [1.0; 3],
             white_balance: name,
         })
+    }
+
+    /// Exposure compensation per channel (R, G, B) in EV.
+    pub fn set_exposure_ev(&mut self, ev: [f64; 3]) {
+        self.gain = ev.map(|e| 2f64.powf(e.clamp(EV_RANGE.0, EV_RANGE.1)));
+    }
+
+    /// Per-channel median of the linear output (before exposure) in the area
+    /// `(x, y, width, height)`, sampled on a coarse grid.
+    pub fn median_linear(&self, raw: &Raw, area: (usize, usize, usize, usize)) -> [f64; 3] {
+        const GRID: usize = 96;
+        let (x0, y0, w, h) = area;
+        let mut chans: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::with_capacity(GRID * GRID));
+        for gy in 0..GRID {
+            for gx in 0..GRID {
+                let px = sample_rgb(raw, x0 + gx * w / GRID, y0 + gy * h / GRID);
+                let n: [f64; 3] = std::array::from_fn(|c| {
+                    ((px[c] as f64 - self.black[c]) / (self.white[c] - self.black[c])).max(0.0)
+                });
+                for (c, v) in chans.iter_mut().enumerate() {
+                    let m = &self.matrix[c];
+                    v.push((m[0] * n[0] + m[1] * n[1] + m[2] * n[2]).max(0.0));
+                }
+            }
+        }
+        chans.map(|mut v| {
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        })
+    }
+
+    /// The EV that renders a scene of median luminance `scene` at the encoded level `target`.
+    pub fn exposure_for(scene: f64, target: f64) -> f64 {
+        let (mut lo, mut hi) = EV_RANGE;
+        for _ in 0..40 {
+            let mid = (lo + hi) / 2.0;
+            if encode(scene * 2f64.powf(mid)) < target {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        (lo + hi) / 2.0
     }
 
     /// Converts one row of interleaved raw RGB (sensor units) in place.
@@ -140,13 +210,25 @@ impl Developer {
             let n: [f64; 3] = std::array::from_fn(|c| {
                 ((px[c] as f64 - self.black[c]) / (self.white[c] - self.black[c])).max(0.0)
             });
-            for (c, out) in px.iter_mut().enumerate() {
+            let mut lin: [f64; 3] = std::array::from_fn(|c| {
                 let m = &self.matrix[c];
-                let lin = (m[0] * n[0] + m[1] * n[1] + m[2] * n[2]).clamp(0.0, 1.0);
-                let pos = lin * CURVE_SIZE as f64;
+                ((m[0] * n[0] + m[1] * n[1] + m[2] * n[2]) * self.gain[c]).clamp(0.0, 1.0)
+            });
+            // A saturated channel under-reports its colour, which turns bright skies yellow-green.
+            // Blend those pixels towards white as the brightest channel nears saturation.
+            let peak = n.iter().cloned().fold(0.0, f64::max);
+            let t = ((peak - CLIP_START) / (1.0 - CLIP_START)).clamp(0.0, 1.0);
+            if t > 0.0 {
+                let top = lin.iter().cloned().fold(0.0, f64::max);
+                for l in &mut lin {
+                    *l += (top - *l) * t;
+                }
+            }
+            for (out, l) in px.iter_mut().zip(lin) {
+                let pos = l * CURVE_SIZE as f64;
                 let i = (pos as usize).min(CURVE_SIZE - 1);
-                let t = pos - i as f64;
-                *out = (self.curve[i] * (1.0 - t) + self.curve[i + 1] * t).round() as u16;
+                let f = pos - i as f64;
+                *out = (self.curve[i] * (1.0 - f) + self.curve[i + 1] * f).round() as u16;
             }
         }
     }
@@ -160,24 +242,26 @@ fn black_levels(raw: &Raw, camf: &Camf) -> Result<[f64; 3], Error> {
             .filter(|m| m.len() == 4)
             .map(|m| [m[0], m[1], m[2], m[3]])
     };
-    let mut areas: Vec<[f64; 4]> = Vec::new();
+    // (is a rectangle, area) -- the column ranges are only trusted if they agree with the
+    // rectangles: some files (DP1 Merrill) list a column range that is not actually shielded.
+    let mut areas: Vec<(bool, [f64; 4])> = Vec::new();
     // The bottom strip is specified incorrectly by sd Quattro H firmware.
     let skip_bottom = camf.number("CAMERAID") == Some(41.0);
-    areas.extend(rect("DarkShieldTop"));
+    areas.extend(rect("DarkShieldTop").map(|a| (true, a)));
     if !skip_bottom {
-        areas.extend(rect("DarkShieldBottom"));
+        areas.extend(rect("DarkShieldBottom").map(|a| (true, a)));
     }
     if let Some(c) = camf.matrix("DarkShieldColRange").filter(|m| m.len() == 4) {
-        areas.push([c[0], 0.0, c[1], f64::MAX]);
-        areas.push([c[2], 0.0, c[3], f64::MAX]);
+        areas.push((false, [c[0], 0.0, c[1], f64::MAX]));
+        areas.push((false, [c[2], 0.0, c[3], f64::MAX]));
     }
     if areas.is_empty() {
         return Err(Error::MissingCalibration("DarkShield"));
     }
 
-    // (width, height, scale of the area coordinates, sample accessor) per channel.
     let mut out = [0.0; 3];
     for (c, slot) in out.iter_mut().enumerate() {
+        // Area coordinates are in full-resolution pixels; the low Quattro layers are half size.
         let (w, h, scale) = match raw {
             Raw::Merrill { width, height, .. } => (*width, *height, 1.0),
             Raw::Quattro {
@@ -194,25 +278,87 @@ fn black_levels(raw: &Raw, camf: &Camf) -> Result<[f64; 3], Error> {
                 }
             }
         };
-        let (mut sum, mut count) = (0u64, 0u64);
-        for a in &areas {
+        // (is a rectangle, sum, count) per area.
+        let mut stats: Vec<(bool, u64, u64)> = Vec::new();
+        for (is_rect, a) in &areas {
             let x0 = (a[0] * scale) as usize;
             let y0 = (a[1] * scale) as usize;
             let x1 = ((a[2] * scale).min(w as f64 - 1.0)) as usize;
             let y1 = ((a[3] * scale).min(h as f64 - 1.0)) as usize;
-            for y in y0..=y1.min(h - 1) {
+            let (mut sum, mut count) = (0u64, 0u64);
+            for y in y0..=y1 {
                 for x in x0..=x1 {
                     sum += sample(raw, c, x, y) as u64;
                     count += 1;
                 }
             }
+            if count > 0 {
+                stats.push((*is_rect, sum, count));
+            }
         }
-        if count == 0 {
+        let pooled = |keep: &dyn Fn(&(bool, u64, u64)) -> bool| {
+            let (s, n) = stats
+                .iter()
+                .filter(|a| keep(a))
+                .fold((0, 0), |t, a| (t.0 + a.1, t.1 + a.2));
+            (n > 0).then(|| s as f64 / n as f64)
+        };
+        let reference = pooled(&|a| a.0).or_else(|| pooled(&|_| true));
+        let Some(reference) = reference else {
             return Err(Error::MissingCalibration("DarkShield"));
-        }
-        *slot = sum as f64 / count as f64;
+        };
+        let tolerance = reference * 0.01 + 2.0;
+        let trusted =
+            |a: &(bool, u64, u64)| a.0 || (a.1 as f64 / a.2 as f64 - reference).abs() <= tolerance;
+        *slot = pooled(&trusted).unwrap_or(reference);
     }
     Ok(out)
+}
+
+fn sample_rgb(raw: &Raw, x: usize, y: usize) -> [u16; 3] {
+    match raw {
+        Raw::Merrill { width, height, .. } => {
+            let (x, y) = (x.min(width - 1), y.min(height - 1));
+            std::array::from_fn(|c| sample(raw, c, x, y))
+        }
+        Raw::Quattro {
+            low_width,
+            low_height,
+            top_width,
+            top_height,
+            ..
+        } => {
+            let lo = |v: usize, max: usize| (v / 2).min(max - 1);
+            [
+                sample(raw, 0, lo(x, *low_width), lo(y, *low_height)),
+                sample(raw, 1, lo(x, *low_width), lo(y, *low_height)),
+                sample(raw, 2, x.min(top_width - 1), y.min(top_height - 1)),
+            ]
+        }
+    }
+}
+
+/// Per-channel median (0..1, sRGB-encoded) of a JPEG, decoded at reduced size.
+pub fn jpeg_median_rgb(jpeg: &[u8]) -> Option<[f64; 3]> {
+    let mut dec = jpeg_decoder::Decoder::new(jpeg);
+    dec.read_info().ok()?;
+    dec.scale(512, 512).ok()?;
+    let pixels = dec.decode().ok()?;
+    let info = dec.info()?;
+    let mut chans: [Vec<u8>; 3] = match info.pixel_format {
+        jpeg_decoder::PixelFormat::RGB24 => {
+            std::array::from_fn(|c| pixels.chunks_exact(3).map(|p| p[c]).collect())
+        }
+        jpeg_decoder::PixelFormat::L8 => std::array::from_fn(|_| pixels.clone()),
+        _ => return None,
+    };
+    if chans[0].is_empty() {
+        return None;
+    }
+    for v in &mut chans {
+        v.sort_unstable();
+    }
+    Some(chans.map(|v| v[v.len() / 2] as f64 / 255.0))
 }
 
 fn sample(raw: &Raw, c: usize, x: usize, y: usize) -> u16 {
@@ -317,9 +463,46 @@ mod tests {
         let v = 100.0 + 0.1 * (4095.0 - 100.0);
         let mut row = [v as u16; 3];
         d.apply(&mut row);
-        let enc = |l: f64| (srgb_encode(l) * 65535.0).round();
+        let enc = |l: f64| (encode(l) * 65535.0).round();
         assert!((row[0] as f64 - enc(0.2)).abs() < 40.0, "{row:?}");
         assert!((row[1] as f64 - enc(0.1)).abs() < 40.0, "{row:?}");
+    }
+
+    #[test]
+    fn exposure_for_inverts_the_curve() {
+        for target in [0.2, 0.5, 0.8] {
+            let ev = Developer::exposure_for(0.1, target);
+            assert!(
+                (encode(0.1 * 2f64.powf(ev)) - target).abs() < 1e-6,
+                "{target} -> {ev}"
+            );
+        }
+        // A scene already at the target needs no compensation.
+        assert!(Developer::exposure_for(0.18, encode(0.18)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn one_ev_doubles_linear_light() {
+        let mut d = Developer::new(&raw(), &camf(1.0), None).unwrap();
+        let v = 100.0 + 0.05 * (4095.0 - 100.0);
+        let mut base = [v as u16; 3];
+        d.apply(&mut base);
+        d.set_exposure_ev([1.0; 3]);
+        let mut up = [v as u16; 3];
+        d.apply(&mut up);
+        // Green has gain 1: 0.05 -> 0.10 linear.
+        assert!(
+            (up[1] as f64 - encode(0.1) * 65535.0).abs() < 60.0,
+            "{up:?}"
+        );
+        assert!(up[1] > base[1]);
+    }
+
+    #[test]
+    fn tone_curve_keeps_black_and_white() {
+        assert_eq!(encode(0.0), 0.0);
+        assert!((encode(1.0) - 1.0).abs() < 1e-12);
+        assert!(encode(0.3) < srgb_encode(0.3) || encode(0.9) > srgb_encode(0.9));
     }
 
     #[test]
