@@ -270,9 +270,11 @@ const MERRILL_RED_TRIM: f64 = 1.04;
 
 /// The table's gains are relative to a green gain of about 0.855, while the per-white-balance
 /// `WBGain` entries are relative to 1. Found by comparing with those entries (about 1.16) and then
-/// tuned against the camera's own JPEG: with 1.17 neutral areas of dp0 Quattro shots come out
-/// within 3% (1.0 would be off by 50%).
-const COLOR_TEMP_GAIN_SCALE: f64 = 1.17;
+/// tuned: red against the camera's own JPEG (neutral areas of dp0 Quattro shots within 3%; 1.0
+/// would be off by 50%), blue against Photo Pro's TIFF output. Four dp0 Quattro files (all at
+/// 5000K) agreed on red 1.18-1.20 and blue 1.10-1.12; a single 1.17 left blue 6-13/255 too high.
+const COLOR_TEMP_RED_SCALE: f64 = 1.18;
+const COLOR_TEMP_BLUE_SCALE: f64 = 1.12;
 
 /// White balance by colour temperature (Quattro "ColorTemp" setting): the gains and colour
 /// matrix are interpolated from `ColorTempTableInfo` at the file's `ColorTempValue`. The table has
@@ -292,8 +294,11 @@ fn color_temp_calibration(camf: &Camf) -> Option<(f64, [f64; 3], [f64; 9])> {
         let t = (kelvin - a[0]) / (b[0] - a[0]);
         std::array::from_fn(|c| a[c] + (b[c] - a[c]) * t)
     };
-    let scale = COLOR_TEMP_GAIN_SCALE;
-    let gain = [row[2] * scale, 1.0, row[1] * scale];
+    let gain = [
+        row[2] * COLOR_TEMP_RED_SCALE,
+        1.0,
+        row[1] * COLOR_TEMP_BLUE_SCALE,
+    ];
     let cc: [f64; 9] = std::array::from_fn(|c| row[3 + c]);
     Some((kelvin, gain, cc))
 }
@@ -801,13 +806,13 @@ mod tests {
         let (k, gain, cc) = color_temp_calibration(&color_temp_camf(5000.0)).unwrap();
         assert_eq!(k, 5000.0);
         // Halfway: red 0.9, blue 0.9, each scaled to the WBGain convention; green stays 1.
-        assert!((gain[0] - 0.9 * COLOR_TEMP_GAIN_SCALE).abs() < 1e-9);
-        assert!((gain[2] - 0.9 * COLOR_TEMP_GAIN_SCALE).abs() < 1e-9);
+        assert!((gain[0] - 0.9 * COLOR_TEMP_RED_SCALE).abs() < 1e-9);
+        assert!((gain[2] - 0.9 * COLOR_TEMP_BLUE_SCALE).abs() < 1e-9);
         assert_eq!(gain[1], 1.0);
         assert_eq!(&cc[..3], &[3.0, -3.0, 1.0]);
         // Outside the table the nearest row is used.
         let (_, low, _) = color_temp_calibration(&color_temp_camf(1000.0)).unwrap();
-        assert!((low[0] - 0.8 * COLOR_TEMP_GAIN_SCALE).abs() < 1e-9);
+        assert!((low[0] - 0.8 * COLOR_TEMP_RED_SCALE).abs() < 1e-9);
     }
 
     #[test]
