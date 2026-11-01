@@ -142,6 +142,14 @@ impl Developer {
             (Some(c), Some(s)) if s > 0.0 => c / s,
             _ => 1.0,
         };
+        // Merrill files carry a second, much milder colour matrix (CP2). The per-white-balance
+        // CCMatrix has coefficients up to about -4, so a few percent of white balance error turns
+        // into a strong colour cast; against the camera's own JPEG, neutral areas come out about
+        // 11% off with CCMatrix and within 3% with CP2. Files without it use the CCMatrix.
+        let cc = camf
+            .matrix("CP2_Matrix")
+            .filter(|m| m.len() == 9)
+            .map_or(cc, <[f64]>::to_vec);
         let mut matrix = [[0.0; 3]; 3];
         for (i, row) in matrix.iter_mut().enumerate() {
             for (j, m) in row.iter_mut().enumerate() {
@@ -503,6 +511,20 @@ mod tests {
         assert_eq!(encode(0.0), 0.0);
         assert!((encode(1.0) - 1.0).abs() < 1e-12);
         assert!(encode(0.3) < srgb_encode(0.3) || encode(0.9) > srgb_encode(0.9));
+    }
+
+    #[test]
+    fn cp2_matrix_replaces_the_white_balance_matrix_when_present() {
+        let mut c = camf(1.0);
+        // Swap red and green outputs so the effect is visible.
+        c.0.push(m(
+            "CP2_Matrix",
+            &[0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        ));
+        let d = Developer::new(&raw(), &c, None).unwrap();
+        assert_eq!(d.matrix[0], [0.0, 1.0, 0.0]);
+        let d = Developer::new(&raw(), &camf(1.0), None).unwrap();
+        assert_eq!(d.matrix[0], [2.0, 0.0, 0.0]);
     }
 
     #[test]
