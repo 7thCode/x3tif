@@ -5,81 +5,268 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>x3tif</title>
 <style>
-  :root { color-scheme: light dark; font-family: -apple-system, "Segoe UI", sans-serif; }
-  body { margin: 0; height: 100vh; display: flex; flex-direction: column; box-sizing: border-box; padding: 14px; gap: 10px; }
-  #drop { flex: 1; min-height: 90px; display: flex; align-items: center; justify-content: center; text-align: center;
-          border: 2px dashed #8888; border-radius: 12px; color: #888; transition: .15s; }
-  body.over #drop { border-color: #3b82f6; color: #3b82f6; background: #3b82f622; }
-  #mode { display: flex; gap: 14px; font-size: 12px; justify-content: center; }
+  :root { color-scheme: light dark; font-family: -apple-system, "Segoe UI", sans-serif; font-size: 13px; }
+  * { box-sizing: border-box; }
+  body { margin: 0; height: 100vh; overflow: hidden; display: grid; grid-template-columns: 1fr 300px; grid-template-rows: 100vh; }
+  #view { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; padding: 12px; gap: 8px; }
+  #stage { position: relative; flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center;
+           border: 2px dashed #8888; border-radius: 12px; overflow: hidden; transition: .15s; }
+  body.over #stage { border-color: #3b82f6; background: #3b82f622; }
+  body.has #stage { border-style: solid; border-color: #8883; }
+  #pv { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: none; }
+  body.has #pv { display: block; }
+  #hint { position: absolute; text-align: center; color: #888; pointer-events: none; line-height: 1.7; }
+  body.has #hint { display: none; }
+  #busy { position: absolute; right: 10px; top: 8px; font-size: 12px; color: #888; display: none; }
+  #busy.on { display: block; }
+  #info { font-size: 12px; color: #888; min-height: 16px; font-variant-numeric: tabular-nums; }
+  aside { border-left: 1px solid #8884; padding: 12px; display: flex; flex-direction: column; gap: 10px; min-height: 0; overflow: auto; }
+  h2 { font-size: 12px; margin: 0; color: #888; font-weight: 600; }
+  #files { list-style: none; margin: 0; padding: 0; max-height: 28vh; overflow: auto; border: 1px solid #8884; border-radius: 8px; min-height: 34px; }
+  #files li { display: flex; gap: 6px; padding: 5px 8px; cursor: pointer; align-items: baseline; }
+  #files li + li { border-top: 1px solid #8882; }
+  #files li.sel { background: #3b82f633; }
+  #files .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #files .state { font-size: 11px; color: #888; white-space: nowrap; max-width: 45%; overflow: hidden; text-overflow: ellipsis; }
+  #files li.ok .state { color: #16a34a; } #files li.err .state { color: #dc2626; } #files li.run .state { color: #3b82f6; }
+  #mode { display: flex; gap: 12px; }
   #mode label { cursor: pointer; }
-  #mode small { color: #888; }
-  #exp { display: none; gap: 8px; font-size: 12px; justify-content: center; align-items: center; }
-  body.dev #exp { display: flex; }
-  #exp input[type=range] { width: 140px; }
-  #exp input:disabled { opacity: .4; }
-  ul { list-style: none; margin: 0; padding: 0; max-height: 45vh; overflow: auto; font-size: 12px; }
-  li { padding: 3px 0; display: flex; gap: 6px; }
-  li .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
-  li.ok .state { color: #16a34a; } li.err .state { color: #dc2626; } li.run .state { color: #888; }
+  fieldset { border: 1px solid #8884; border-radius: 8px; margin: 0; padding: 8px 10px 10px; display: grid; gap: 8px; }
+  fieldset:disabled { opacity: .45; }
+  legend { font-size: 12px; color: #888; padding: 0 4px; }
+  .row { display: grid; grid-template-columns: 52px 1fr 52px; align-items: center; gap: 6px; }
+  .row.wb { grid-template-columns: 52px 1fr; }
+  .row output { text-align: right; font-variant-numeric: tabular-nums; color: #888; font-size: 12px; }
+  .row input[type=range] { width: 100%; min-width: 0; }
+  select { width: 100%; min-width: 0; }
+  #auto-row { display: flex; align-items: center; gap: 6px; font-size: 12px; margin-left: 58px; color: #888; }
+  .buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  button { padding: 6px 8px; border-radius: 6px; border: 1px solid #8886; background: #8881; color: inherit; font: inherit; cursor: pointer; }
+  button:hover:not(:disabled) { background: #8882; }
+  button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+  button.primary:hover:not(:disabled) { background: #1d4ed8; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.wide { grid-column: 1 / -1; }
+  #msg { font-size: 12px; min-height: 16px; color: #888; }
+  #msg.err { color: #dc2626; }
+  #note { font-size: 11px; color: #888; }
 </style>
 </head>
 <body>
-  <div id="drop">X3F ファイルをここにドロップ<br>→ 16bit TIFF に変換(同じフォルダに保存)</div>
-  <div id="mode">
-    <label><input type="radio" name="mode" value="raw" checked> 生データ <small>(リニア・無加工)</small></label>
-    <label><input type="radio" name="mode" value="developed"> 見たまま <small>(WB・色・sRGB)</small></label>
-  </div>
-  <div id="exp">
-    <label><input type="checkbox" id="auto" checked> 自動 <small>(プレビューに合わせる)</small></label>
-    <input type="range" id="ev" min="-4" max="4" step="0.1" value="0" disabled>
-    <span id="evv">+0.0 EV</span>
-  </div>
-  <ul id="log"></ul>
+  <section id="view">
+    <div id="stage">
+      <img id="pv" alt="プレビュー">
+      <div id="hint">X3F ファイルをここにドロップ<br><small>プレビューを見ながら調整して、TIFF に保存します</small></div>
+      <div id="busy">更新中…</div>
+    </div>
+    <div id="info"></div>
+  </section>
+
+  <aside>
+    <h2>ファイル</h2>
+    <ul id="files"></ul>
+
+    <div id="mode">
+      <label><input type="radio" name="mode" value="developed" checked> 見たまま</label>
+      <label><input type="radio" name="mode" value="raw"> 生データ</label>
+    </div>
+
+    <fieldset id="adj">
+      <legend>調整</legend>
+      <div class="row wb">
+        <label for="wb">WB</label>
+        <select id="wb"></select>
+      </div>
+      <div class="row">
+        <label for="ev">露出</label>
+        <input type="range" id="ev" min="-4" max="4" step="0.1" value="0" disabled>
+        <output id="ev-out">+0.0</output>
+      </div>
+      <label id="auto-row" title="カメラが記録したプレビュー JPEG の明るさに合わせます"><input type="checkbox" id="auto" checked> 自動</label>
+      <div class="row">
+        <label for="red">赤</label>
+        <input type="range" id="red" min="0.5" max="2" step="0.01" value="1">
+        <output id="red-out">1.00</output>
+      </div>
+      <div class="row">
+        <label for="blue">青</label>
+        <input type="range" id="blue" min="0.5" max="2" step="0.01" value="1">
+        <output id="blue-out">1.00</output>
+      </div>
+      <div class="row">
+        <label for="tone">トーン</label>
+        <input type="range" id="tone" min="0" max="1" step="0.01" value="0.5">
+        <output id="tone-out">0.50</output>
+      </div>
+    </fieldset>
+    <div id="note"></div>
+
+    <div class="buttons">
+      <button id="save" class="primary" disabled>保存</button>
+      <button id="save-all" disabled>すべて保存</button>
+      <button id="reset">標準に戻す</button>
+      <button id="save-defaults">既定値として保存</button>
+    </div>
+    <div id="msg"></div>
+  </aside>
+
 <script>
   const { listen } = window.__TAURI__.event;
   const { invoke } = window.__TAURI__.core;
-  const log = document.getElementById('log');
-  const autoEv = document.getElementById('auto');
-  const ev = document.getElementById('ev');
-  const showEv = () => { document.getElementById('evv').textContent = (ev.value >= 0 ? '+' : '') + Number(ev.value).toFixed(1) + ' EV'; };
-  autoEv.onchange = () => { ev.disabled = autoEv.checked; };
-  ev.oninput = showEv;
-  document.querySelectorAll('input[name=mode]').forEach(r => r.onchange = () =>
-    document.body.classList.toggle('dev', document.querySelector('input[name=mode]:checked').value === 'developed'));
+  const $ = id => document.getElementById(id);
+
+  // Names as the backend knows them (core::develop::WHITE_BALANCES) with their labels.
+  const WB = [
+    ['', 'ファイルのまま'], ['Auto', 'オート'], ['Sunlight', '太陽光'], ['Shade', '日陰'],
+    ['Overcast', '曇り'], ['Incandescent', '電球'], ['Fluorescent', '蛍光灯'], ['Flash', 'フラッシュ'],
+    ['Custom', 'カスタム'], ['ColorTemp', '色温度'], ['AutoLSP', 'オート(LSP)'],
+  ];
+  for (const [v, label] of WB) $('wb').add(new Option(label, v));
+
+  // The calibrated values: what "標準に戻す" returns to, and what a missing settings file means.
+  const STANDARD = { white_balance: null, red: 1, blue: 1, tone: 0.5 };
+  const sliders = ['red', 'blue', 'tone'];
+
+  const files = [];          // { path, name, state, cls }
+  let selected = -1;
+  let busy = false;          // a save is running
+
   const base = p => p.split(/[\\/]/).pop();
+  const fmt = (v, signed) => (signed && v >= 0 ? '+' : '') + Number(v).toFixed(signed ? 1 : 2);
+  const say = (text, err) => { $('msg').textContent = text; $('msg').className = err ? 'err' : ''; };
+  const isRaw = () => document.querySelector('input[name=mode]:checked').value === 'raw';
 
-  function row(path) {
-    const li = document.createElement('li');
-    li.className = 'run';
-    li.innerHTML = '<span class="name"></span><span class="state">変換中…</span>';
-    li.querySelector('.name').textContent = base(path);
-    log.prepend(li);
-    return li;
+  function settings() {
+    return {
+      white_balance: $('wb').value || null,
+      red: Number($('red').value),
+      blue: Number($('blue').value),
+      tone: Number($('tone').value),
+    };
+  }
+  function apply(s) {
+    $('wb').value = s.white_balance || '';
+    if ($('wb').value !== (s.white_balance || '')) $('wb').value = '';
+    for (const k of sliders) { $(k).value = s[k]; $(k + '-out').textContent = fmt(s[k]); }
+  }
+  const exposure = () => ($('auto').checked ? null : Number($('ev').value));
+
+  // ---- preview: one request at a time, always for the latest settings ----
+  let timer = 0, inflight = false, again = false, previewFailed = false;
+
+  function schedule() {
+    clearTimeout(timer);
+    timer = setTimeout(refresh, 60);
   }
 
-  // Convert one at a time: each decode holds the whole file and image in memory.
-  let queue = Promise.resolve();
-  function enqueue(path) {
-    const li = row(path);
-    const developed = document.querySelector('input[name=mode]:checked').value === 'developed';
-    const exposure = autoEv.checked ? null : Number(ev.value);
-    queue = queue.then(async () => {
-      const state = li.querySelector('.state');
-      try {
-        const out = await invoke('convert', { path, developed, exposure });
-        li.className = 'ok'; state.textContent = '→ ' + base(out);
-      } catch (e) {
-        li.className = 'err'; state.textContent = String(e);
+  async function refresh() {
+    if (selected < 0) return;
+    if (inflight) { again = true; return; }
+    inflight = true; again = false;
+    const file = files[selected];
+    $('busy').classList.add('on');
+    const side = Math.round(Math.max($('stage').clientWidth, $('stage').clientHeight) * (window.devicePixelRatio || 1));
+    try {
+      const r = await invoke('preview', {
+        path: file.path, exposure: exposure(), settings: settings(),
+        maxSide: Math.min(2000, Math.max(400, side)),
+      });
+      if (files[selected] === file) {          // the selection may have moved on meanwhile
+        $('pv').src = r.image;
+        $('info').textContent = `${r.width} × ${r.height} px(表示用に縮小)  ·  露出 ${fmt(r.exposure, true)} EV  ·  WB ${r.white_balance}`;
+        if ($('auto').checked) { $('ev').value = r.exposure; $('ev-out').textContent = fmt(r.exposure, true); }
+        if (previewFailed) say('');
+        previewFailed = false;
       }
-    });
+    } catch (e) {
+      if (files[selected] === file) { $('pv').removeAttribute('src'); $('info').textContent = ''; say(String(e), true); previewFailed = true; }
+    } finally {
+      inflight = false;
+      $('busy').classList.remove('on');
+      if (again) schedule();
+    }
   }
 
+  // ---- file list ----
+  function render() {
+    const ul = $('files');
+    ul.replaceChildren(...files.map((f, i) => {
+      const li = document.createElement('li');
+      li.className = (f.cls || '') + (i === selected ? ' sel' : '');
+      const name = document.createElement('span'); name.className = 'name'; name.textContent = f.name; name.title = f.path;
+      const state = document.createElement('span'); state.className = 'state'; state.textContent = f.state || '';
+      li.append(name, state);
+      li.onclick = () => select(i);
+      return li;
+    }));
+    document.body.classList.toggle('has', selected >= 0);
+    $('save').disabled = busy || selected < 0;
+    $('save-all').disabled = busy || files.length < 2;
+  }
+
+  function select(i) {
+    selected = i;
+    $('pv').removeAttribute('src');
+    $('info').textContent = '';
+    render();
+    schedule();
+  }
+
+  function addFiles(paths) {
+    const ok = paths.filter(p => /\.x3f$/i.test(p));
+    if (ok.length < paths.length) say('X3F 以外のファイルは無視しました', true);
+    let first = -1;
+    for (const path of ok) {
+      let i = files.findIndex(f => f.path === path);
+      if (i < 0) { files.push({ path, name: base(path) }); i = files.length - 1; }
+      if (first < 0) first = i;
+    }
+    if (first >= 0) { if (ok.length === paths.length) say(''); select(first); }
+  }
+
+  // ---- saving ----
+  async function save(list) {
+    if (busy) return;
+    busy = true; render();
+    const s = settings(), developed = !isRaw(), ev = exposure();
+    for (const f of list) {
+      f.state = '変換中…'; f.cls = 'run'; render();
+      try {
+        const out = await invoke('convert', { path: f.path, developed, exposure: ev, settings: s });
+        f.state = '→ ' + base(out); f.cls = 'ok';
+      } catch (e) { f.state = String(e); f.cls = 'err'; }
+      render();
+    }
+    busy = false; render();
+  }
+  $('save').onclick = () => selected >= 0 && save([files[selected]]);
+  $('save-all').onclick = () => save(files.slice());
+
+  $('save-defaults').onclick = async () => {
+    try { apply(await invoke('save_settings', { settings: settings() })); say('既定値として保存しました'); }
+    catch (e) { say(String(e), true); }
+  };
+  $('reset').onclick = () => { apply(STANDARD); schedule(); say(''); };
+
+  // ---- controls ----
+  for (const k of sliders) $(k).oninput = () => { $(k + '-out').textContent = fmt($(k).value); schedule(); };
+  $('wb').onchange = schedule;
+  $('ev').oninput = () => { $('ev-out').textContent = fmt($('ev').value, true); schedule(); };
+  $('auto').onchange = () => { $('ev').disabled = $('auto').checked; schedule(); };
+  document.querySelectorAll('input[name=mode]').forEach(r => r.onchange = () => {
+    $('adj').disabled = isRaw();
+    $('note').textContent = isRaw() ? '生データは調整を適用せず、センサーの値のまま保存します。' : '';
+  });
+
+  // ---- start up and drag & drop ----
+  invoke('get_settings').then(apply).catch(() => apply(STANDARD));
   listen('tauri://drag-enter', () => document.body.classList.add('over'));
   listen('tauri://drag-leave', () => document.body.classList.remove('over'));
   listen('tauri://drag-drop', e => {
     document.body.classList.remove('over');
-    e.payload.paths.forEach(enqueue);
+    addFiles(e.payload.paths);
   });
+  render();
 </script>
 </body>
 </html>

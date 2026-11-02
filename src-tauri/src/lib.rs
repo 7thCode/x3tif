@@ -229,20 +229,26 @@ fn convert_file(input: &Path, mode: Mode) -> Result<PathBuf, String> {
     result.map(|()| out)
 }
 
+/// `exposure` is an EV; none means "match the camera's preview".
+fn mode_for(developed: bool, exposure: Option<f64>, tuning: Tuning) -> Mode {
+    match (developed, exposure) {
+        (false, _) => Mode::Raw,
+        (true, Some(ev)) => Mode::Developed(Exposure::Ev(ev), tuning),
+        (true, None) => Mode::Developed(Exposure::Auto, tuning),
+    }
+}
+
+/// `settings` are the adjustments on the screen; without them the saved defaults are used.
 #[tauri::command]
 async fn convert(
     app: tauri::AppHandle,
     path: String,
     developed: bool,
     exposure: Option<f64>,
+    settings: Option<Settings>,
 ) -> Result<String, String> {
-    // `exposure` is an EV; none means "match the camera's preview".
-    let tuning = get_settings(app).tuning();
-    let mode = match (developed, exposure) {
-        (false, _) => Mode::Raw,
-        (true, Some(ev)) => Mode::Developed(Exposure::Ev(ev), tuning),
-        (true, None) => Mode::Developed(Exposure::Auto, tuning),
-    };
+    let tuning = settings.unwrap_or_else(|| get_settings(app)).tuning();
+    let mode = mode_for(developed, exposure, tuning);
     tauri::async_runtime::spawn_blocking(move || convert_file(Path::new(&path), mode))
         .await
         .map_err(|e| e.to_string())?
@@ -367,6 +373,20 @@ mod tests {
             &cache.0.lock().unwrap().as_ref().unwrap().1
         ));
         fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn the_mode_follows_the_screen_choices() {
+        let t = Tuning {
+            red: 1.2,
+            ..Tuning::default()
+        };
+        assert_eq!(mode_for(false, Some(1.0), t), Mode::Raw);
+        assert_eq!(
+            mode_for(true, Some(0.5), t),
+            Mode::Developed(Exposure::Ev(0.5), t)
+        );
+        assert_eq!(mode_for(true, None, t), Mode::Developed(Exposure::Auto, t));
     }
 
     #[test]
