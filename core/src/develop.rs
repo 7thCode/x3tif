@@ -12,7 +12,73 @@ use crate::x3f::{Error, Raw};
 pub enum Mode {
     #[default]
     Raw,
-    Developed(Exposure),
+    Developed(Exposure, Tuning),
+}
+
+/// White balance names a file can carry (the ones `wb_from_code` produces).
+pub const WHITE_BALANCES: [&str; 10] = [
+    "Auto",
+    "Sunlight",
+    "Shade",
+    "Overcast",
+    "Incandescent",
+    "Fluorescent",
+    "Flash",
+    "Custom",
+    "ColorTemp",
+    "AutoLSP",
+];
+
+/// Allowed range of the red and blue gain multipliers.
+pub const GAIN_RANGE: (f64, f64) = (0.5, 2.0);
+
+/// Adjustments on top of the calibrated defaults. `Tuning::default()` changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tuning {
+    /// Use this white balance instead of the one the file was shot with.
+    pub white_balance: Option<&'static str>,
+    /// Multipliers on the red and blue gains (1.0 = as calibrated).
+    pub red: f64,
+    pub blue: f64,
+    /// How far the S-shaped tone curve is mixed in, 0 (plain sRGB) to 1.
+    pub tone: f64,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Tuning {
+            white_balance: None,
+            red: 1.0,
+            blue: 1.0,
+            tone: TONE_STRENGTH,
+        }
+    }
+}
+
+impl Tuning {
+    /// The same values with everything out of range or not finite replaced by its default,
+    /// so a hand-edited or damaged settings file can never produce nonsense.
+    pub fn sanitized(self) -> Tuning {
+        let d = Tuning::default();
+        let pick = |v: f64, lo: f64, hi: f64, default: f64| {
+            if v.is_finite() && (lo..=hi).contains(&v) {
+                v
+            } else {
+                default
+            }
+        };
+        Tuning {
+            white_balance: self.white_balance,
+            red: pick(self.red, GAIN_RANGE.0, GAIN_RANGE.1, d.red),
+            blue: pick(self.blue, GAIN_RANGE.0, GAIN_RANGE.1, d.blue),
+            tone: pick(self.tone, 0.0, 1.0, d.tone),
+        }
+    }
+}
+
+/// The known white balance name equal to `name`, if any.
+pub fn white_balance_name(name: &str) -> Option<&'static str> {
+    WHITE_BALANCES.iter().copied().find(|w| *w == name)
 }
 
 /// Exposure compensation for the developed output.
@@ -215,6 +281,7 @@ pub struct Developer {
     curve: Vec<f64>,
     /// Per-channel linear gain applied before the curve (2^EV).
     gain: [f64; 3],
+    tone: f64,
     pub white_balance: String,
 }
 
@@ -225,9 +292,14 @@ const CLIP_START: f64 = 0.9;
 const TONE_STRENGTH: f64 = 0.5;
 
 /// sRGB encoding followed by a gentle S-curve, like the contrast a camera JPEG has.
+#[cfg(test)]
 fn encode(l: f64) -> f64 {
+    encode_with(l, TONE_STRENGTH)
+}
+
+fn encode_with(l: f64, tone: f64) -> f64 {
     let e = srgb_encode(l.clamp(0.0, 1.0));
-    e + TONE_STRENGTH * (e * e * (3.0 - 2.0 * e) - e)
+    e + tone * (e * e * (3.0 - 2.0 * e) - e)
 }
 
 fn srgb_encode(l: f64) -> f64 {
@@ -315,7 +387,13 @@ fn color_temp_calibration(camf: &Camf) -> Option<(f64, [f64; 3], [f64; 9])> {
 
 impl Developer {
     /// `header_wb` is the white balance name from the X3F header (older files only).
-    pub fn new(raw: &Raw, camf: &Camf, header_wb: Option<&str>) -> Result<Developer, Error> {
+    pub fn new(
+        raw: &Raw,
+        camf: &Camf,
+        header_wb: Option<&str>,
+        tuning: &Tuning,
+    ) -> Result<Developer, Error> {
+        let tuning = tuning.sanitized();
         let depth = image_depth(camf).ok_or(Error::MissingCalibration("ImageDepth"))?;
         let max = ((1u32 << depth) - 1) as f64;
         let black = black_levels(raw, camf)?;
@@ -330,6 +408,7 @@ impl Developer {
         } else {
             wanted
         };
+        let wanted = tuning.white_balance.map_or(wanted, str::to_owned);
         let color_temp = (wanted == "ColorTemp")
             .then(|| color_temp_calibration(camf))
             .flatten();
@@ -371,6 +450,8 @@ impl Developer {
         if matches!(raw, Raw::Merrill { .. }) {
             gain[0] *= MERRILL_RED_TRIM;
         }
+        gain[0] *= tuning.red;
+        gain[2] *= tuning.blue;
         let iso = match (camf.number("CaptureISO"), camf.number("SensorISO")) {
             (Some(c), Some(s)) if s > 0.0 => c / s,
             _ => 1.0,
@@ -382,7 +463,7 @@ impl Developer {
             }
         }
         let curve = (0..=CURVE_SIZE)
-            .map(|i| encode(i as f64 / CURVE_SIZE as f64) * 65535.0)
+            .map(|i| encode_with(i as f64 / CURVE_SIZE as f64, tuning.tone) * 65535.0)
             .collect();
         Ok(Developer {
             black,
@@ -390,8 +471,14 @@ impl Developer {
             matrix,
             curve,
             gain: [1.0; 3],
+            tone: tuning.tone,
             white_balance: name,
         })
+    }
+
+    /// The tone curve strength this developer was built with.
+    pub fn tone(&self) -> f64 {
+        self.tone
     }
 
     /// Exposure compensation per channel (R, G, B) in EV.
@@ -424,11 +511,11 @@ impl Developer {
     }
 
     /// The EV that renders a scene of median luminance `scene` at the encoded level `target`.
-    pub fn exposure_for(scene: f64, target: f64) -> f64 {
+    pub fn exposure_for(scene: f64, target: f64, tone: f64) -> f64 {
         let (mut lo, mut hi) = EV_RANGE;
         for _ in 0..40 {
             let mid = (lo + hi) / 2.0;
-            if encode(scene * 2f64.powf(mid)) < target {
+            if encode_with(scene * 2f64.powf(mid), tone) < target {
                 lo = mid;
             } else {
                 hi = mid;
@@ -679,18 +766,124 @@ mod tests {
 
     #[test]
     fn sd_quattro_auto_uses_the_sunlight_gains() {
-        let d = Developer::new(&raw(), &with_camera(40.0), None).unwrap();
+        let d = Developer::new(&raw(), &with_camera(40.0), None, &Tuning::default()).unwrap();
         assert_eq!(d.white_balance, "Sunlight");
     }
 
     #[test]
     fn other_cameras_keep_their_auto_white_balance() {
         for camera in [41.0, 83.0] {
-            let d = Developer::new(&raw(), &with_camera(camera), None).unwrap();
+            let d = Developer::new(&raw(), &with_camera(camera), None, &Tuning::default()).unwrap();
             assert_eq!(d.white_balance, "Auto", "camera {camera}");
         }
-        let d = Developer::new(&raw(), &camf(1.0), None).unwrap();
+        let d = Developer::new(&raw(), &camf(1.0), None, &Tuning::default()).unwrap();
         assert_eq!(d.white_balance, "Auto");
+    }
+
+    fn developed(tuning: Tuning) -> Vec<u16> {
+        let d = Developer::new(&raw(), &camf(1.0), None, &tuning).unwrap();
+        let v = 100 + (0.1 * (4095.0 - 100.0)) as u16;
+        let mut row = [v; 3];
+        d.apply(&mut row);
+        row.to_vec()
+    }
+
+    #[test]
+    fn default_tuning_changes_nothing() {
+        let t = Tuning::default();
+        assert_eq!(
+            (t.white_balance, t.red, t.blue, t.tone),
+            (None, 1.0, 1.0, TONE_STRENGTH)
+        );
+        assert_eq!(t.sanitized(), t);
+        // Same curve as the fixed one used before the tuning existed.
+        for l in [0.0, 0.05, 0.3, 0.9, 1.0] {
+            assert_eq!(encode_with(l, t.tone), encode(l));
+        }
+    }
+
+    #[test]
+    fn out_of_range_tuning_falls_back_to_the_defaults() {
+        let bad = Tuning {
+            white_balance: Some("Sunlight"),
+            red: f64::NAN,
+            blue: 99.0,
+            tone: -1.0,
+        };
+        let s = bad.sanitized();
+        assert_eq!((s.red, s.blue, s.tone), (1.0, 1.0, TONE_STRENGTH));
+        assert_eq!(s.white_balance, Some("Sunlight"));
+        let edge = Tuning {
+            red: GAIN_RANGE.0,
+            blue: GAIN_RANGE.1,
+            tone: 1.0,
+            ..Tuning::default()
+        };
+        assert_eq!(edge.sanitized(), edge);
+    }
+
+    #[test]
+    fn white_balance_names_must_be_known() {
+        assert_eq!(white_balance_name("Overcast"), Some("Overcast"));
+        assert_eq!(white_balance_name("overcast"), None);
+        assert_eq!(white_balance_name("../etc"), None);
+    }
+
+    #[test]
+    fn red_and_blue_multipliers_scale_only_their_channel() {
+        let base = developed(Tuning::default());
+        let red = developed(Tuning {
+            red: 1.5,
+            ..Tuning::default()
+        });
+        let blue = developed(Tuning {
+            blue: 0.7,
+            ..Tuning::default()
+        });
+        assert!(
+            red[0] > base[0] && red[1] == base[1] && red[2] == base[2],
+            "{base:?} {red:?}"
+        );
+        assert!(
+            blue[2] < base[2] && blue[0] == base[0] && blue[1] == base[1],
+            "{base:?} {blue:?}"
+        );
+    }
+
+    #[test]
+    fn tone_zero_is_plain_srgb() {
+        let plain = developed(Tuning {
+            tone: 0.0,
+            ..Tuning::default()
+        });
+        let expected = (srgb_encode(0.1) * 65535.0).round();
+        assert!(
+            (plain[1] as f64 - expected).abs() < 40.0,
+            "{plain:?} {expected}"
+        );
+        assert_ne!(plain, developed(Tuning::default()));
+    }
+
+    #[test]
+    fn a_chosen_white_balance_replaces_the_files_own() {
+        // The file is shot on Auto (red gain 2); asking for Sunlight (gain 1) must win.
+        let auto = developed(Tuning::default());
+        let sun = developed(Tuning {
+            white_balance: Some("Sunlight"),
+            ..Tuning::default()
+        });
+        assert!(sun[0] < auto[0], "{auto:?} {sun:?}");
+        let d = Developer::new(
+            &raw(),
+            &camf(1.0),
+            None,
+            &Tuning {
+                white_balance: Some("Sunlight"),
+                ..Tuning::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(d.white_balance, "Sunlight");
     }
 
     #[test]
@@ -702,7 +895,7 @@ mod tests {
 
     #[test]
     fn black_is_measured_and_subtracted_and_white_maps_to_full_scale() {
-        let d = Developer::new(&raw(), &camf(1.0), None).unwrap();
+        let d = Developer::new(&raw(), &camf(1.0), None, &Tuning::default()).unwrap();
         assert_eq!(d.black, [100.0; 3]);
         let mut row = [100u16, 100, 100, 4095, 4095, 4095];
         d.apply(&mut row);
@@ -713,7 +906,7 @@ mod tests {
 
     #[test]
     fn white_balance_gain_scales_red_before_the_curve() {
-        let d = Developer::new(&raw(), &camf(1.0), None).unwrap();
+        let d = Developer::new(&raw(), &camf(1.0), None, &Tuning::default()).unwrap();
         // Normalised input 0.1 on every channel; red gain 2 (times the Merrill trim) -> 0.2 linear, others 0.1.
         let v = 100.0 + 0.1 * (4095.0 - 100.0);
         let mut row = [v as u16; 3];
@@ -729,19 +922,19 @@ mod tests {
     #[test]
     fn exposure_for_inverts_the_curve() {
         for target in [0.2, 0.5, 0.8] {
-            let ev = Developer::exposure_for(0.1, target);
+            let ev = Developer::exposure_for(0.1, target, TONE_STRENGTH);
             assert!(
                 (encode(0.1 * 2f64.powf(ev)) - target).abs() < 1e-6,
                 "{target} -> {ev}"
             );
         }
         // A scene already at the target needs no compensation.
-        assert!(Developer::exposure_for(0.18, encode(0.18)).abs() < 1e-6);
+        assert!(Developer::exposure_for(0.18, encode(0.18), TONE_STRENGTH).abs() < 1e-6);
     }
 
     #[test]
     fn one_ev_doubles_linear_light() {
-        let mut d = Developer::new(&raw(), &camf(1.0), None).unwrap();
+        let mut d = Developer::new(&raw(), &camf(1.0), None, &Tuning::default()).unwrap();
         let v = 100.0 + 0.05 * (4095.0 - 100.0);
         let mut base = [v as u16; 3];
         d.apply(&mut base);
@@ -854,23 +1047,23 @@ mod tests {
 
     #[test]
     fn color_temp_setting_uses_the_table_instead_of_auto() {
-        let d = Developer::new(&raw(), &color_temp_camf(5000.0), None).unwrap();
+        let d = Developer::new(&raw(), &color_temp_camf(5000.0), None, &Tuning::default()).unwrap();
         assert_eq!(d.white_balance, "ColorTemp 5000K");
         // Without the table it falls back to Auto as before.
-        let d = Developer::new(&raw(), &camf(11.0), None).unwrap();
+        let d = Developer::new(&raw(), &camf(11.0), None, &Tuning::default()).unwrap();
         assert_eq!(d.white_balance, "Auto");
     }
 
     #[test]
     fn unknown_white_balance_falls_back_to_auto() {
         // 11 = ColorTemp has no matrices in the lists.
-        let d = Developer::new(&raw(), &camf(11.0), None).unwrap();
+        let d = Developer::new(&raw(), &camf(11.0), None, &Tuning::default()).unwrap();
         assert_eq!(d.white_balance, "Auto");
     }
 
     #[test]
     fn missing_calibration_is_reported() {
-        let err = Developer::new(&raw(), &Camf::default(), None)
+        let err = Developer::new(&raw(), &Camf::default(), None, &Tuning::default())
             .err()
             .unwrap();
         assert!(matches!(err, Error::MissingCalibration(_)));
