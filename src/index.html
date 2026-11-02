@@ -5,9 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>x3tif</title>
 <style>
-  :root { color-scheme: light dark; font-family: -apple-system, "Segoe UI", sans-serif; font-size: 13px; }
+  :root { color-scheme: dark; font-family: -apple-system, "Segoe UI", sans-serif; font-size: 13px; }
   * { box-sizing: border-box; }
-  body { margin: 0; height: 100vh; overflow: hidden; display: grid; grid-template-columns: 1fr 300px; grid-template-rows: 100vh; }
+  body { margin: 0; background: #1c1c1e; color: #e5e5e7; height: 100vh; overflow: hidden; display: grid; grid-template-columns: 1fr 300px; grid-template-rows: 100vh; }
   #view { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; padding: 12px; gap: 8px; }
   #stage { position: relative; flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center;
            border: 2px dashed #8888; border-radius: 12px; overflow: hidden; transition: .15s; }
@@ -28,7 +28,7 @@
   #files li.sel { background: #3b82f633; }
   #files .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #files .state { font-size: 11px; color: #888; white-space: nowrap; max-width: 45%; overflow: hidden; text-overflow: ellipsis; }
-  #files li.ok .state { color: #16a34a; } #files li.err .state { color: #dc2626; } #files li.run .state { color: #3b82f6; }
+  #files li.ok .state { color: #4ade80; } #files li.err .state { color: #f87171; } #files li.run .state { color: #60a5fa; }
   #mode { display: flex; gap: 12px; }
   #mode label { cursor: pointer; }
   fieldset { border: 1px solid #8884; border-radius: 8px; margin: 0; padding: 8px 10px 10px; display: grid; gap: 8px; }
@@ -48,7 +48,7 @@
   button:disabled { opacity: .45; cursor: default; }
   button.wide { grid-column: 1 / -1; }
   #msg { font-size: 12px; min-height: 16px; color: #888; }
-  #msg.err { color: #dc2626; }
+  #msg.err { color: #f87171; }
   #note { font-size: 11px; color: #888; }
 </style>
 </head>
