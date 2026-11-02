@@ -1,6 +1,6 @@
 [package]
 name = "x3tif"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "Sigma Foveon X3F to 16-bit TIFF converter"
 license = "MIT"
