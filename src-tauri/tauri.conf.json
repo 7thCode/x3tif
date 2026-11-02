@@ -11,6 +11,7 @@
     "windows": [
       {
         "title": "x3tif",
+        "theme": "Dark",
         "width": 980,
         "height": 660,
         "minWidth": 760,
