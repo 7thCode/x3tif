@@ -1,11 +1,15 @@
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
     io::BufWriter,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::SystemTime,
 };
 use tauri::Manager;
 use x3tif_core::develop::{white_balance_name, Exposure, Mode, Tuning};
+use x3tif_core::preview::Loaded;
 
 /// The saved defaults for the developed output (`settings.json` in the app config folder).
 /// Missing fields, unknown fields and a damaged file all fall back to the calibrated defaults.
@@ -114,13 +118,101 @@ fn output_path(input: &Path) -> PathBuf {
         .expect("unbounded range")
 }
 
-fn convert_file(input: &Path, mode: Mode) -> Result<PathBuf, String> {
+fn check_x3f(input: &Path) -> Result<(), String> {
     let is_x3f = input
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("x3f"));
-    if !is_x3f {
-        return Err("X3F ファイルではありません".into());
+    if is_x3f {
+        Ok(())
+    } else {
+        Err("X3F ファイルではありません".into())
     }
+}
+
+/// The last file decoded for the preview, so that moving a slider only re-develops it.
+/// Keyed by path, size and modification time, so a file replaced on disk is read again.
+#[derive(Default)]
+struct PreviewCache(Mutex<Option<(PreviewKey, Arc<Loaded>)>>);
+
+type PreviewKey = (PathBuf, u64, Option<SystemTime>);
+
+#[derive(Debug, Serialize)]
+struct PreviewReply {
+    /// `data:image/png;base64,...`
+    image: String,
+    width: usize,
+    height: usize,
+    /// The exposure used in EV (the automatic one when none was given).
+    exposure: f64,
+    /// The white balance actually used.
+    white_balance: String,
+}
+
+const DEFAULT_PREVIEW_SIDE: usize = 1000;
+
+fn render_preview(
+    cache: &PreviewCache,
+    input: &Path,
+    exposure: Option<f64>,
+    settings: &Settings,
+    max_side: Option<usize>,
+) -> Result<PreviewReply, String> {
+    check_x3f(input)?;
+    let meta = fs::metadata(input).map_err(|e| format!("読み込めません: {e}"))?;
+    let key = (input.to_path_buf(), meta.len(), meta.modified().ok());
+    let loaded = {
+        let mut slot = cache.0.lock().unwrap_or_else(|e| e.into_inner());
+        match &*slot {
+            Some((k, l)) if *k == key => Arc::clone(l),
+            _ => {
+                *slot = None; // a failed load must not leave the previous file's picture behind
+                let data = fs::read(input).map_err(|e| format!("読み込めません: {e}"))?;
+                let l = Arc::new(Loaded::load(data).map_err(|e| e.to_string())?);
+                *slot = Some((key, Arc::clone(&l)));
+                l
+            }
+        }
+    };
+    let exposure = exposure.map_or(Exposure::Auto, Exposure::Ev);
+    let r = loaded
+        .render(
+            exposure,
+            &settings.tuning(),
+            max_side.unwrap_or(DEFAULT_PREVIEW_SIDE),
+        )
+        .map_err(|e| e.to_string())?;
+    let png = x3tif_core::png::encode_rgb8(r.image.width, r.image.height, &r.image.rgb)
+        .ok_or("プレビューを作れません")?;
+    Ok(PreviewReply {
+        image: format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png)
+        ),
+        width: r.image.width,
+        height: r.image.height,
+        exposure: r.exposure_ev,
+        white_balance: r.white_balance,
+    })
+}
+
+#[tauri::command]
+async fn preview(
+    cache: tauri::State<'_, Arc<PreviewCache>>,
+    path: String,
+    exposure: Option<f64>,
+    settings: Settings,
+    max_side: Option<usize>,
+) -> Result<PreviewReply, String> {
+    let cache = Arc::clone(&cache);
+    tauri::async_runtime::spawn_blocking(move || {
+        render_preview(&cache, Path::new(&path), exposure, &settings, max_side)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn convert_file(input: &Path, mode: Mode) -> Result<PathBuf, String> {
+    check_x3f(input)?;
     let data = fs::read(input).map_err(|e| format!("読み込めません: {e}"))?;
     let out = output_path(input);
     let tmp = out.with_extension("tif.part");
@@ -159,10 +251,12 @@ async fn convert(
 
 pub fn run() {
     tauri::Builder::default()
+        .manage(Arc::new(PreviewCache::default()))
         .invoke_handler(tauri::generate_handler![
             convert,
             get_settings,
-            save_settings
+            save_settings,
+            preview
         ])
         .run(tauri::generate_context!())
         .expect("failed to run x3tif");
@@ -226,6 +320,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(saved, Settings::default());
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn preview_rejects_bad_files_and_keeps_no_stale_picture() {
+        let d = temp_dir("pvbad");
+        let cache = PreviewCache::default();
+        let s = Settings::default();
+        let txt = d.join("note.txt");
+        fs::write(&txt, b"x").unwrap();
+        assert!(render_preview(&cache, &txt, None, &s, None).is_err());
+        assert!(render_preview(&cache, &d.join("missing.x3f"), None, &s, None).is_err());
+        let bad = d.join("bad.x3f");
+        fs::write(&bad, vec![0u8; 64]).unwrap();
+        assert!(render_preview(&cache, &bad, None, &s, None).is_err());
+        assert!(cache.0.lock().unwrap().is_none());
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    /// Runs only when `X3TIF_SAMPLE` points at a real X3F file.
+    #[test]
+    fn previews_a_real_sample_and_reuses_the_decoded_file() {
+        let Some(sample) = std::env::var_os("X3TIF_SAMPLE") else {
+            return;
+        };
+        let d = temp_dir("pvreal");
+        let input = d.join("sample.x3f");
+        fs::copy(sample, &input).unwrap();
+        let cache = PreviewCache::default();
+
+        let a = render_preview(&cache, &input, None, &Settings::default(), Some(300)).unwrap();
+        assert!(a.image.starts_with("data:image/png;base64,"));
+        assert_eq!(a.width.max(a.height), 300);
+        let first = Arc::clone(&cache.0.lock().unwrap().as_ref().unwrap().1);
+
+        let tuned = Settings {
+            red: 1.3,
+            ..Settings::default()
+        };
+        let b = render_preview(&cache, &input, Some(0.5), &tuned, Some(300)).unwrap();
+        assert_ne!(a.image, b.image);
+        assert_eq!(b.exposure, 0.5);
+        assert!(Arc::ptr_eq(
+            &first,
+            &cache.0.lock().unwrap().as_ref().unwrap().1
+        ));
         fs::remove_dir_all(d).unwrap();
     }
 

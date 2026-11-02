@@ -635,7 +635,7 @@ fn black_levels(raw: &Raw, camf: &Camf) -> Result<[f64; 3], Error> {
     Ok(out)
 }
 
-fn sample_rgb(raw: &Raw, x: usize, y: usize) -> [u16; 3] {
+pub(crate) fn sample_rgb(raw: &Raw, x: usize, y: usize) -> [u16; 3] {
     match raw {
         Raw::Merrill { width, height, .. } => {
             let (x, y) = (x.min(width - 1), y.min(height - 1));

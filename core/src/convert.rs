@@ -145,13 +145,28 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W, mode: Mode) -> Result<(
     Ok(())
 }
 
+/// Median colour (0..1, sRGB-encoded) of the camera's embedded JPEG preview, if the file has a
+/// decodable one.
+pub(crate) fn preview_target(x3f: &X3f) -> Option<[f64; 3]> {
+    let mut previews: Vec<&[u8]> = x3f.preview_jpegs().collect();
+    previews.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    previews.into_iter().find_map(develop::jpeg_median_rgb)
+}
+
 /// EV that makes the developed picture as bright as the camera's embedded JPEG preview (0 if the
 /// file has no decodable preview). One value for all channels: matching each channel's median
 /// to the preview as well overshoots (a saturated sky turns the whole picture violet).
 fn auto_exposure(x3f: &X3f, developer: &Developer, raw: &Raw, area: &Area) -> [f64; 3] {
-    let mut previews: Vec<&[u8]> = x3f.preview_jpegs().collect();
-    previews.sort_by_key(|p| std::cmp::Reverse(p.len()));
-    let Some(target) = previews.into_iter().find_map(develop::jpeg_median_rgb) else {
+    exposure_for_target(preview_target(x3f), developer, raw, area)
+}
+
+pub(crate) fn exposure_for_target(
+    target: Option<[f64; 3]>,
+    developer: &Developer,
+    raw: &Raw,
+    area: &Area,
+) -> [f64; 3] {
+    let Some(target) = target else {
         return [0.0; 3];
     };
     let scene = developer.median_linear(raw, (area.x, area.y, area.width, area.height));
@@ -167,17 +182,17 @@ fn auto_exposure(x3f: &X3f, developer: &Developer, raw: &Raw, area: &Area) -> [f
 }
 
 /// The part of the decoded image that is actual picture.
-struct Area {
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
+pub(crate) struct Area {
+    pub(crate) x: usize,
+    pub(crate) y: usize,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
 }
 
 /// CAMF `ActiveImageArea` (inclusive, in sensor coordinates) relative to the decoded image, which
 /// starts at the origin of `KeepImageArea`. Everything outside it is dark shield and margins.
 /// Falls back to the whole image if the file gives no usable area.
-fn active_area(camf: &Camf, width: usize, height: usize) -> Area {
+pub(crate) fn active_area(camf: &Camf, width: usize, height: usize) -> Area {
     let whole = Area {
         x: 0,
         y: 0,
