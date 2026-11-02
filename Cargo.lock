@@ -4081,7 +4081,7 @@ dependencies = [
 
 [[package]]
 name = "x3tif"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "base64 0.21.7",
  "serde",
@@ -4093,7 +4093,7 @@ dependencies = [
 
 [[package]]
 name = "x3tif-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "jpeg-decoder",
  "miniz_oxide 0.9.1",
