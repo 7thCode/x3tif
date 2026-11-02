@@ -248,6 +248,15 @@ fn canonical_wb(name: &str) -> &str {
     }
 }
 
+/// sd Quattro files shot with auto white balance (code 1). The camera's own Auto estimate varies
+/// from scene to scene, while Photo Pro's TIFFs stay close to the Sunlight preset: over 13 files
+/// (gray patches, red/blue relative to green, /255) Sunlight's mean error is 2.9 against 5.0 for
+/// Auto and its worst 6.2 against 10.6, better in 10 files and worse in 3. Only the sd Quattro
+/// (CAMERAID 40) was measured; the sd Quattro H keeps its Auto.
+fn is_sd_quattro_auto(camf: &Camf) -> bool {
+    camf.number("CAMERAID") == Some(40.0) && camf.number("WhiteBalance") == Some(1.0)
+}
+
 fn wb_from_code(code: u32) -> &'static str {
     match code {
         2 => "Sunlight",
@@ -315,6 +324,11 @@ impl Developer {
         let wanted = match camf.number("WhiteBalance") {
             Some(code) => wb_from_code(code as u32).to_owned(),
             None => header_wb.unwrap_or("Auto").to_owned(),
+        };
+        let wanted = if is_sd_quattro_auto(camf) {
+            "Sunlight".to_owned()
+        } else {
+            wanted
         };
         let color_temp = (wanted == "ColorTemp")
             .then(|| color_temp_calibration(camf))
@@ -655,6 +669,28 @@ mod tests {
             m("AutoCC", &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
             m("SunCC", &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
         ])
+    }
+
+    fn with_camera(camera: f64) -> Camf {
+        let mut c = camf(1.0);
+        c.0.push(m("CAMERAID", &[camera]));
+        c
+    }
+
+    #[test]
+    fn sd_quattro_auto_uses_the_sunlight_gains() {
+        let d = Developer::new(&raw(), &with_camera(40.0), None).unwrap();
+        assert_eq!(d.white_balance, "Sunlight");
+    }
+
+    #[test]
+    fn other_cameras_keep_their_auto_white_balance() {
+        for camera in [41.0, 83.0] {
+            let d = Developer::new(&raw(), &with_camera(camera), None).unwrap();
+            assert_eq!(d.white_balance, "Auto", "camera {camera}");
+        }
+        let d = Developer::new(&raw(), &camf(1.0), None).unwrap();
+        assert_eq!(d.white_balance, "Auto");
     }
 
     #[test]
