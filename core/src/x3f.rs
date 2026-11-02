@@ -302,7 +302,8 @@ impl X3f {
             *s = r.u32()? as usize;
         }
 
-        let payload = &self.data[r.pos..h.end];
+        // The section's declared size can be smaller than the headers we just read.
+        let payload = self.data.get(r.pos..h.end).ok_or(Error::Truncated)?;
         let mut planes: [&[u8]; TRUE_PLANES] = [&[]; TRUE_PLANES];
         let mut off = 0usize;
         for i in 0..TRUE_PLANES {
@@ -315,7 +316,8 @@ impl X3f {
 
         if !quattro {
             let (w, h_) = (h.columns, h.rows);
-            let mut rgb = vec![0u16; w * h_ * 3];
+            let len = sample_count(&[(w, h_, 3)])?;
+            let mut rgb = vec![0u16; len];
             for c in 0..3 {
                 decode_plane(planes[c], &tree, seed[c], w, h_, w, |idx, v| {
                     rgb[idx * 3 + c] = v
@@ -331,14 +333,20 @@ impl X3f {
         let (lw, lh) = plane_dims[0];
         let (tw, th) = plane_dims[2];
         if lh == h.rows / 2 {
-            let mut low = vec![0u16; lw * lh * 3];
+            // Both low layers are written into one buffer sized by the first plane.
+            if plane_dims[1] != plane_dims[0] {
+                return Err(Error::Corrupt("mismatched Quattro layer sizes"));
+            }
+            let low_len = sample_count(&[(lw, lh, 3)])?;
+            let top_len = sample_count(&[(tw, th, 1)])?;
+            let mut low = vec![0u16; low_len];
             for c in 0..2 {
                 let (cols, rows) = plane_dims[c];
                 decode_plane(planes[c], &tree, seed[c], cols, rows, lw, |idx, v| {
                     low[idx * 3 + c] = v
                 })?;
             }
-            let mut top = vec![0u16; tw * th];
+            let mut top = vec![0u16; top_len];
             decode_plane(planes[2], &tree, seed[2], tw, th, tw, |idx, v| top[idx] = v)?;
             Ok(Raw::Quattro {
                 low_width: lw,
@@ -350,7 +358,10 @@ impl X3f {
             })
         } else if lh == h.rows {
             // Binned Quattro: all three layers have the same size.
-            let mut rgb = vec![0u16; lw * lh * 3];
+            if plane_dims.iter().any(|&d| d != plane_dims[0]) {
+                return Err(Error::Corrupt("mismatched Quattro layer sizes"));
+            }
+            let mut rgb = vec![0u16; sample_count(&[(lw, lh, 3)])?];
             for c in 0..3 {
                 let (cols, rows) = plane_dims[c];
                 decode_plane(planes[c], &tree, seed[c], cols, rows, lw, |idx, v| {
@@ -366,6 +377,25 @@ impl X3f {
             Err(Error::Corrupt("unknown Quattro layer size"))
         }
     }
+}
+
+/// Upper bound on the samples of one decoded buffer (512 MiB of u16). Real files stay below a
+/// quarter of this (sd Quattro H: about 8000 x 5300 x 3).
+const MAX_SAMPLES: usize = 1 << 28;
+
+/// Number of samples for `(width, height, channels)` buffers, rejecting zero sizes and sizes the
+/// file could use to exhaust memory or overflow the arithmetic.
+fn sample_count(dims: &[(usize, usize, usize)]) -> Result<usize> {
+    let mut total = 0usize;
+    for &(w, h, c) in dims {
+        let n = w
+            .checked_mul(h)
+            .and_then(|n| n.checked_mul(c))
+            .filter(|&n| n > 0 && n <= MAX_SAMPLES)
+            .ok_or(Error::Corrupt("invalid image size"))?;
+        total += n;
+    }
+    Ok(total)
 }
 
 /// Binary tree over the TRUE Huffman table. Leaf value = number of difference bits.
@@ -500,4 +530,84 @@ fn decode_plane(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn u32s(v: &[u32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    /// An X3F holding one image section: `format`/`columns`/`rows` in its header, `body` after the
+    /// 28 byte header, and `declared_size` as the size the directory claims for the section.
+    fn x3f_with_image(
+        type_format: (u32, u32),
+        columns: u32,
+        rows: u32,
+        body: &[u8],
+        declared_size: u32,
+    ) -> Vec<u8> {
+        let mut f = vec![0u8; 128];
+        f[..4].copy_from_slice(b"FOVb");
+        f[4..8].copy_from_slice(&0x0002_0300u32.to_le_bytes());
+        let off = f.len() as u32;
+        f.extend_from_slice(b"SECi");
+        f.extend(u32s(&[0, type_format.0, type_format.1, columns, rows]));
+        f.extend_from_slice(body);
+        f.resize(f.len().max((off + declared_size) as usize), 0);
+        let dir = f.len() as u32;
+        f.extend_from_slice(b"SECd");
+        f.extend(u32s(&[0, 1, off, declared_size, 0, dir]));
+        f
+    }
+
+    /// Merrill/Quattro image body: seeds, empty Huffman table, plane sizes of zero.
+    fn body(quattro: bool, dims: [(u16, u16); 3]) -> Vec<u8> {
+        let mut b = Vec::new();
+        if quattro {
+            for (c, r) in dims {
+                b.extend(c.to_le_bytes());
+                b.extend(r.to_le_bytes());
+            }
+        }
+        b.extend([0u8; 8]); // three seeds + one unknown u16
+        b.extend([0u8; 2]); // table terminator
+        if quattro {
+            b.extend([0u8; 4]);
+        }
+        b.extend([0u8; 12]); // plane sizes
+        b
+    }
+
+    fn decode(data: Vec<u8>) -> Result<Raw> {
+        X3f::parse(data)?.decode()
+    }
+
+    #[test]
+    fn section_smaller_than_its_headers_is_rejected() {
+        let f = x3f_with_image((1, 0x23), 100, 100, &body(true, [(1, 1); 3]), 24);
+        assert!(matches!(decode(f), Err(Error::Truncated)));
+    }
+
+    #[test]
+    fn huge_or_zero_image_sizes_are_rejected_without_allocating() {
+        let b = body(false, [(0, 0); 3]);
+        for (w, h) in [(u32::MAX, u32::MAX), (100_000, 100_000), (0, 10)] {
+            let f = x3f_with_image((1, 0x1e), w, h, &b, 128);
+            assert!(matches!(decode(f), Err(Error::Corrupt(_))), "{w}x{h}");
+        }
+        let q = body(true, [(0, 0), (0, 0), (60_000, 60_000)]);
+        let f = x3f_with_image((1, 0x23), 100, 0, &q, 128);
+        assert!(matches!(decode(f), Err(Error::Corrupt(_))));
+    }
+
+    #[test]
+    fn quattro_layers_of_different_sizes_are_rejected() {
+        let b = body(true, [(10, 50), (10, 60), (20, 100)]);
+        let f = x3f_with_image((1, 0x23), 20, 100, &b, 128);
+        let r = decode(f);
+        assert!(matches!(r, Err(Error::Corrupt(_))), "{:?}", r.err());
+    }
 }
