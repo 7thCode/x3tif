@@ -1,9 +1,101 @@
+use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
     io::BufWriter,
     path::{Path, PathBuf},
 };
-use x3tif_core::develop::{Exposure, Mode};
+use tauri::Manager;
+use x3tif_core::develop::{white_balance_name, Exposure, Mode, Tuning};
+
+/// The saved defaults for the developed output (`settings.json` in the app config folder).
+/// Missing fields, unknown fields and a damaged file all fall back to the calibrated defaults.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct Settings {
+    /// `None` keeps the white balance the file was shot with.
+    white_balance: Option<String>,
+    red: f64,
+    blue: f64,
+    tone: f64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        let t = Tuning::default();
+        Settings {
+            white_balance: None,
+            red: t.red,
+            blue: t.blue,
+            tone: t.tone,
+        }
+    }
+}
+
+impl Settings {
+    fn tuning(&self) -> Tuning {
+        Tuning {
+            white_balance: self.white_balance.as_deref().and_then(white_balance_name),
+            red: self.red,
+            blue: self.blue,
+            tone: self.tone,
+        }
+        .sanitized()
+    }
+
+    /// The settings as they will actually be used: unknown names dropped, bad values reset.
+    fn normalized(&self) -> Settings {
+        let t = self.tuning();
+        Settings {
+            white_balance: t.white_balance.map(str::to_owned),
+            red: t.red,
+            blue: t.blue,
+            tone: t.tone,
+        }
+    }
+}
+
+fn settings_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|d| d.join("settings.json"))
+}
+
+fn load_settings(path: &Path) -> Settings {
+    fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Settings>(&b).ok())
+        .map(|s| s.normalized())
+        .unwrap_or_default()
+}
+
+/// Writes the normalized settings through a temporary file, so a crash never leaves half a file.
+fn store_settings(path: &Path, settings: &Settings) -> Result<Settings, String> {
+    let settings = settings.normalized();
+    let json = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("保存できません: {e}"))?;
+    }
+    let tmp = path.with_extension("json.part");
+    fs::write(&tmp, json)
+        .and_then(|()| fs::rename(&tmp, path))
+        .map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            format!("保存できません: {e}")
+        })?;
+    Ok(settings)
+}
+
+#[tauri::command]
+fn get_settings(app: tauri::AppHandle) -> Settings {
+    settings_path(&app).map_or_else(Settings::default, |p| load_settings(&p))
+}
+
+#[tauri::command]
+fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<Settings, String> {
+    let path = settings_path(&app).ok_or("設定の保存先が見つかりません")?;
+    store_settings(&path, &settings)
+}
 
 /// `<dir>/<stem>.tif`, or `<stem>-1.tif`, `<stem>-2.tif`... if that already exists.
 fn output_path(input: &Path) -> PathBuf {
@@ -46,12 +138,18 @@ fn convert_file(input: &Path, mode: Mode) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-async fn convert(path: String, developed: bool, exposure: Option<f64>) -> Result<String, String> {
+async fn convert(
+    app: tauri::AppHandle,
+    path: String,
+    developed: bool,
+    exposure: Option<f64>,
+) -> Result<String, String> {
     // `exposure` is an EV; none means "match the camera's preview".
+    let tuning = get_settings(app).tuning();
     let mode = match (developed, exposure) {
         (false, _) => Mode::Raw,
-        (true, Some(ev)) => Mode::Developed(Exposure::Ev(ev)),
-        (true, None) => Mode::Developed(Exposure::Auto),
+        (true, Some(ev)) => Mode::Developed(Exposure::Ev(ev), tuning),
+        (true, None) => Mode::Developed(Exposure::Auto, tuning),
     };
     tauri::async_runtime::spawn_blocking(move || convert_file(Path::new(&path), mode))
         .await
@@ -61,7 +159,11 @@ async fn convert(path: String, developed: bool, exposure: Option<f64>) -> Result
 
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![convert])
+        .invoke_handler(tauri::generate_handler![
+            convert,
+            get_settings,
+            save_settings
+        ])
         .run(tauri::generate_context!())
         .expect("failed to run x3tif");
 }
@@ -75,6 +177,56 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn settings_round_trip_and_default_to_the_calibration() {
+        let d = temp_dir("settings");
+        let path = d.join("conf").join("settings.json");
+        assert_eq!(load_settings(&path), Settings::default());
+        assert_eq!(Settings::default().tuning(), Tuning::default());
+
+        let s = Settings {
+            white_balance: Some("Overcast".into()),
+            red: 1.1,
+            blue: 0.9,
+            tone: 0.25,
+        };
+        assert_eq!(store_settings(&path, &s).unwrap(), s);
+        assert_eq!(load_settings(&path), s);
+        assert!(!path.with_extension("json.part").exists());
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn damaged_or_hostile_settings_never_reach_the_developer() {
+        let d = temp_dir("badsettings");
+        let path = d.join("settings.json");
+        fs::write(&path, b"{ not json").unwrap();
+        assert_eq!(load_settings(&path), Settings::default());
+
+        // Unknown fields are ignored, missing ones default, bad values reset, odd names dropped.
+        fs::write(
+            &path,
+            br#"{"white_balance":"../../etc","red":1e308,"blue":-3,"tone":"x","extra":1}"#,
+        )
+        .unwrap();
+        assert_eq!(load_settings(&path), Settings::default());
+        fs::write(&path, br#"{"red":1.2,"tone":2.0}"#).unwrap();
+        let s = load_settings(&path);
+        assert_eq!((s.red, s.blue, s.tone), (1.2, 1.0, Tuning::default().tone));
+
+        let saved = store_settings(
+            &path,
+            &Settings {
+                white_balance: Some("nonsense".into()),
+                red: f64::NAN,
+                ..Settings::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(saved, Settings::default());
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

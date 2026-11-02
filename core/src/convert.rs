@@ -48,7 +48,7 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W, mode: Mode) -> Result<(
         .unwrap_or_default();
     let mut raw = x3f.decode()?;
     // Raw output stays exactly what the sensor read; only the developed look hides its defects.
-    if matches!(mode, Mode::Developed(_)) {
+    if matches!(mode, Mode::Developed(..)) {
         develop::repair_highlight_pixels(&mut raw, &camf);
         develop::repair_autofocus_pixels(&mut raw, &camf);
     }
@@ -72,8 +72,9 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W, mode: Mode) -> Result<(
     // Per-row finishing step: shift to the 16 bit range (raw) or develop.
     let mut ev = [0.0; 3];
     let developer = match mode {
-        Mode::Developed(exposure) => {
-            let mut d = Developer::new(&raw, &camf, x3f.header_white_balance().as_deref())?;
+        Mode::Developed(exposure, tuning) => {
+            let mut d =
+                Developer::new(&raw, &camf, x3f.header_white_balance().as_deref(), &tuning)?;
             ev = match exposure {
                 Exposure::Ev(ev) => [ev; 3],
                 Exposure::Auto => auto_exposure(&x3f, &d, &raw, &area),
@@ -160,7 +161,7 @@ fn auto_exposure(x3f: &X3f, developer: &Developer, raw: &Raw, area: &Area) -> [f
     // Luminance-weighted mean of the per-channel fits.
     const LUMA: [f64; 3] = [0.2126, 0.7152, 0.0722];
     let ev: f64 = (0..3)
-        .map(|c| LUMA[c] * Developer::exposure_for(scene[c], target[c]))
+        .map(|c| LUMA[c] * Developer::exposure_for(scene[c], target[c], developer.tone()))
         .sum();
     [ev; 3]
 }
