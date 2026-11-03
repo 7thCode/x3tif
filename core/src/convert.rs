@@ -123,20 +123,40 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W, mode: Mode) -> Result<(
             let height = top_height.min(2 * low_height);
             let xs = taps(width, low_width);
             let ys = taps(height, low_height);
+            // Blue on the low layers' grid, for the developed picture's detail transfer.
+            let blue_low = developer.as_ref().map(|_| {
+                let mut plane = vec![0u16; low_width * low_height];
+                for (j, row) in plane.chunks_exact_mut(low_width).enumerate() {
+                    for (i, v) in row.iter_mut().enumerate() {
+                        let at = |dy: usize, dx: usize| {
+                            let y = (2 * j + dy).min(height - 1);
+                            let x = (2 * i + dx).min(width - 1);
+                            top[y * top_width + x] as u32
+                        };
+                        *v = ((at(0, 0) + at(0, 1) + at(1, 0) + at(1, 1) + 2) / 4) as u16;
+                    }
+                }
+                plane
+            });
             tiff::write_rgb16(out, area.width, area.height, &meta, |y, row| {
                 let y = y + area.y;
                 let (y0, y1, wy) = ys[y];
                 for (i, px) in row.chunks_exact_mut(3).enumerate() {
                     let x = i + area.x;
                     let (x0, x1, wx) = xs[x];
-                    for c in 0..2 {
-                        let at = |yy: usize, xx: usize| low[(yy * low_width + xx) * 3 + c] as u32;
-                        // Bilinear with quarter-pixel weights.
+                    // Bilinear with quarter-pixel weights.
+                    let blend = |at: &dyn Fn(usize, usize) -> u32| {
                         let top_row = at(y0, x0) * (4 - wx) + at(y0, x1) * wx;
                         let bot_row = at(y1, x0) * (4 - wx) + at(y1, x1) * wx;
-                        px[c] = ((top_row * (4 - wy) + bot_row * wy + 8) / 16) as u16;
+                        ((top_row * (4 - wy) + bot_row * wy + 8) / 16) as u16
+                    };
+                    for c in 0..2 {
+                        px[c] = blend(&|yy, xx| low[(yy * low_width + xx) * 3 + c] as u32);
                     }
                     px[2] = top[y * top_width + x];
+                    if let (Some(d), Some(plane)) = (&developer, &blue_low) {
+                        d.transfer_detail(px, blend(&|yy, xx| plane[yy * low_width + xx] as u32));
+                    }
                 }
                 finish(row);
             })?;
