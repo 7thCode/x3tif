@@ -2,6 +2,7 @@ pub mod camf;
 pub mod convert;
 pub mod develop;
 pub mod exif;
+pub mod icc;
 pub mod png;
 pub mod preview;
 pub mod tiff;

@@ -17,6 +17,8 @@ pub struct Metadata {
     pub exif: Exif,
     /// Raw XMP packet (tag 700).
     pub xmp: Option<Vec<u8>>,
+    /// ICC profile of the pixel data (tag 34675).
+    pub icc_profile: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -295,6 +297,9 @@ pub fn write_rgb16<W: Write>(
     if exif_block.is_some() {
         tags.push(long(34665, 8));
     }
+    if let Some(icc) = &meta.icc_profile {
+        tags.push(extra(34675, UNDEFINED, icc.len() as u32, icc.clone()));
+    }
 
     let pixel_start = ifd0_at + serialize_ifd(&tags, ifd0_at).len();
     if pixel_start + counts.iter().sum::<usize>() > u32::MAX as usize {
@@ -371,6 +376,40 @@ mod tests {
         let at = strip1 + ((20 - ROWS_PER_STRIP) * w + 2) * 6 + 2;
         assert_eq!(u16_at(&out, at) as usize, 20 * 1000 + 2 * 3 + 1);
         assert_eq!(strips, 3);
+    }
+
+    #[test]
+    fn icc_profile_is_stored_in_tag_34675_after_the_exif_pointer() {
+        let profile: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+        let mut out = Vec::new();
+        let meta = Metadata {
+            icc_profile: Some(profile.clone()),
+            exif: Exif {
+                iso: Some(100),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        write_rgb16(&mut out, 2, 2, &meta, |_, row| row.fill(7)).unwrap();
+
+        let ifd = u32_at(&out, 4) as usize;
+        let n = u16_at(&out, ifd) as usize;
+        let ids: Vec<u16> = (0..n).map(|i| u16_at(&out, ifd + 2 + i * 12)).collect();
+        assert!(
+            ids.windows(2).all(|w| w[0] < w[1]),
+            "tags must be ascending: {ids:?}"
+        );
+        let e = ifd + 2 + ids.iter().position(|&t| t == 34675).unwrap() * 12;
+        assert_eq!(u16_at(&out, e + 2), 7); // UNDEFINED
+        let (count, at) = (u32_at(&out, e + 4) as usize, u32_at(&out, e + 8) as usize);
+        assert_eq!(&out[at..at + count], &profile[..]);
+
+        // Without a profile the tag is absent (raw output).
+        let mut raw = Vec::new();
+        write_rgb16(&mut raw, 2, 2, &Metadata::default(), |_, row| row.fill(7)).unwrap();
+        let ifd = u32_at(&raw, 4) as usize;
+        let n = u16_at(&raw, ifd) as usize;
+        assert!((0..n).all(|i| u16_at(&raw, ifd + 2 + i * 12) != 34675));
     }
 
     #[test]
