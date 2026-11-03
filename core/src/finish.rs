@@ -9,7 +9,8 @@
 //! even across colour edges: against them, the RMS error of ours (in /255, mean of three files)
 //! falls from 5.6 to 2.1 with a Gaussian of sigma 4 on the colour differences; sigma 7 leaves the
 //! tiles about as close (1.16/2.65/1.73 against 1.37/2.42/1.78) and cuts the R-G noise of a flat
-//! green background from 4.17 to 3.14 (Photo Pro 2.84), so that is the width used. Smoothing that is guided by luminance edges did worse, also in the
+//! green background from 4.17 to 3.14 (Photo Pro 2.84), so that was the width used at first; the R-G of the bokeh was still 3.14 against 2.84 and
+//! the user saw slight coarseness, so it is 8.5 now (2.87; tile errors 1.23/2.80/1.83). Smoothing that is guided by luminance edges did worse, also in the
 //! tiles with the strongest colour edges (8.9 -> 2.6 for the plain Gaussian, 2.9-4.9 guided), so
 //! this one is not edge-aware. It leaves luminance untouched.
 //!
@@ -42,8 +43,8 @@
 //! to 3/255 took the bokeh of 2.81 to 2.34 (Photo Pro 2.26) at the cost of the dark file's sharp
 //! response, 0.90 -> 0.77; 4/255 would be 1.98 and 0.70.
 
-const CHROMA_SIGMA: f64 = 7.0;
-const CHROMA_RADIUS: usize = 21; // 3 sigma
+const CHROMA_SIGMA: f64 = 8.5;
+const CHROMA_RADIUS: usize = 26; // 3 sigma
 /// Blur that separates the mid-frequency band (a few pixels) from the low frequencies.
 const WIDE_SIGMA: f64 = 3.5;
 const WIDE_RADIUS: usize = 11; // 3 sigma
@@ -54,9 +55,9 @@ const SHARP_RADIUS: usize = 2;
 const AMOUNT: f32 = 1.2;
 /// Encoded levels (0..65535) of the blurred luminance between which the amount fades in.
 const FADE: (f32, f32) = (0.15 * 65535.0, 0.45 * 65535.0);
-/// Luminance detail smaller than this (levels of 65535, = 3/255) is removed in dark and medium-dark areas, with the
+/// Luminance detail smaller than this (levels of 65535, = 3.5/255) is removed in dark and medium-dark areas, with the
 /// same fade as the sharpening turned around: 0 where the sharpening is full.
-const CORE: f32 = 3.0 * 257.0;
+const CORE: f32 = 3.5 * 257.0;
 /// Rows kept: the one being written and `CHROMA_RADIUS` on each side.
 const WINDOW: usize = 2 * CHROMA_RADIUS + 1;
 
