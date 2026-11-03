@@ -7,8 +7,9 @@
 //! **Colour noise.** The red and green layers have a quarter of the pixels of the blue layer, and
 //! their noise shows as pink and green speckle. Photo Pro's colour differences are very smooth,
 //! even across colour edges: against them, the RMS error of ours (in /255, mean of three files)
-//! falls from 5.6 to 2.1 with a Gaussian of sigma 4 on the colour differences and stays near
-//! that for wider ones. Smoothing that is guided by luminance edges did worse, also in the
+//! falls from 5.6 to 2.1 with a Gaussian of sigma 4 on the colour differences; sigma 7 leaves the
+//! tiles about as close (1.16/2.65/1.73 against 1.37/2.42/1.78) and cuts the R-G noise of a flat
+//! green background from 4.17 to 3.14 (Photo Pro 2.84), so that is the width used. Smoothing that is guided by luminance edges did worse, also in the
 //! tiles with the strongest colour edges (8.9 -> 2.6 for the plain Gaussian, 2.9-4.9 guided), so
 //! this one is not edge-aware. It leaves luminance untouched.
 //!
@@ -27,9 +28,21 @@
 //! removed where the sharpening fades out: noise 1.99, response 0.92; in the bright file
 //! 6.74 -> 6.52 (Photo Pro 5.34), response 0.96 -> 0.91. Larger values cost more texture than they
 //! remove grain.
+//!
+//! **Mid-frequency grain.** What was still coarse is a mottle a few pixels across. The difference
+//! between the luminance blurred with sigma 0.8 and with sigma 2.5 (`WIDE_SIGMA`) is cored by 3/255
+//! (`MID_CORE`) over the whole picture; real texture is far above that and stays. Flat-tile noise
+//! of the three references 6.52/6.12/1.99 -> about 5.4/4.9/1.0 (Photo Pro 5.34/6.15/1.13), sharp
+//! response unchanged or up (0.91/0.86/0.92 -> 0.94/0.90/0.90), bokeh luminance 3.19 -> 2.9
+//! (Photo Pro 2.26).
 
-const CHROMA_SIGMA: f64 = 4.0;
-const CHROMA_RADIUS: usize = 12; // 3 sigma
+const CHROMA_SIGMA: f64 = 7.0;
+const CHROMA_RADIUS: usize = 21; // 3 sigma
+/// Blur that separates the mid-frequency band (a few pixels) from the low frequencies.
+const WIDE_SIGMA: f64 = 2.5;
+const WIDE_RADIUS: usize = 8;
+/// Luminance of that band below this (levels of 65535, = 3/255) is removed everywhere.
+const MID_CORE: f32 = 3.0 * 257.0;
 const SHARP_SIGMA: f64 = 0.8;
 const SHARP_RADIUS: usize = 2;
 const AMOUNT: f32 = 1.2;
@@ -73,6 +86,7 @@ struct Slot {
     px: Vec<u16>,
     /// Luminance blurred horizontally with the sharpening kernel.
     luma: Vec<f32>,
+    luma2: Vec<f32>,
     /// Colour differences blurred horizontally with the colour-noise kernel.
     chroma: [Vec<f32>; 3],
 }
@@ -80,6 +94,7 @@ struct Slot {
 pub struct Finisher {
     width: usize,
     height: usize,
+    wide: Vec<f32>,
     sharp: Vec<f32>,
     smooth: Vec<f32>,
     slots: Vec<Slot>,
@@ -95,11 +110,13 @@ impl Finisher {
         let slot = || Slot {
             px: vec![0; width * 3],
             luma: vec![0.0; width],
+            luma2: vec![0.0; width],
             chroma: std::array::from_fn(|_| vec![0.0; width]),
         };
         Finisher {
             width,
             height,
+            wide: gaussian(WIDE_SIGMA, WIDE_RADIUS),
             sharp: gaussian(SHARP_SIGMA, SHARP_RADIUS),
             smooth: gaussian(CHROMA_SIGMA, CHROMA_RADIUS),
             slots: (0..WINDOW).map(|_| slot()).collect(),
@@ -124,6 +141,7 @@ impl Finisher {
             }
         }
         blur_row(&y, &self.sharp, &mut slot.luma, &mut self.padded);
+        blur_row(&y, &self.wide, &mut slot.luma2, &mut self.padded);
         for (d, out) in diff.iter().zip(slot.chroma.iter_mut()) {
             blur_row(d, &self.smooth, out, &mut self.padded);
         }
@@ -158,6 +176,13 @@ impl Finisher {
             }
         }
 
+        let mut wide = vec![0f32; self.width];
+        for (i, &k) in self.wide.iter().enumerate() {
+            let row = &self.slots[at(i as isize - WIDE_RADIUS as isize)].luma2;
+            for (a, v) in wide.iter_mut().zip(row) {
+                *a += k * v;
+            }
+        }
         let own = &self.slots[at(0)].px;
         for x in 0..self.width {
             let p = &own[x * 3..x * 3 + 3];
@@ -166,7 +191,9 @@ impl Finisher {
             let t = ((blur - FADE.0) / (FADE.1 - FADE.0)).clamp(0.0, 1.0);
             let d = luma - blur;
             let d = d.signum() * (d.abs() - CORE * (1.0 - t * t * (3.0 - 2.0 * t))).max(0.0);
-            let y_out = blur + d * (1.0 + AMOUNT * t * t * (3.0 - 2.0 * t));
+            let m = blur - wide[x];
+            let m = m.signum() * (m.abs() - MID_CORE).max(0.0);
+            let y_out = wide[x] + m + d * (1.0 + AMOUNT * t * t * (3.0 - 2.0 * t));
             for c in 0..3 {
                 out[x * 3 + c] = (y_out + self.acc[c][x]).round().clamp(0.0, 65535.0) as u16;
             }
@@ -238,11 +265,12 @@ mod tests {
 
     #[test]
     fn dark_areas_are_sharpened_less_than_bright_ones() {
-        let step = |lo: u16, hi: u16| {
+        let over = |lo: u16, hi: u16| {
             let out = run(40, 5, |x, _| if x < 20 { [lo; 3] } else { [hi; 3] });
-            (hi as i32 - out[2][20 * 3] as i32).abs()
+            out[2][20 * 3] as i32 - hi as i32
         };
-        assert!(step(3000, 6000) < step(30000, 60000) / 10);
+        assert!(over(30000, 60000) > 1000, "bright edges overshoot");
+        assert!(over(3000, 6000) <= 0, "dark edges do not");
         // Nothing is sharpened in the deepest shadows: no overshoot (the grain removal may soften
         // the edge by about one level of 255).
         let out = run(40, 5, |x, _| if x < 20 { [1000; 3] } else { [2000; 3] });
