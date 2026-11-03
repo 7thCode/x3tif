@@ -282,6 +282,10 @@ pub struct Developer {
     /// Per-channel linear gain applied before the curve (2^EV).
     gain: [f64; 3],
     tone: f64,
+    /// Red-row correction applied to the finished picture, with the sRGB decoding it needs.
+    red_row: Option<([f64; 3], Vec<f32>)>,
+    /// Exposure that `Exposure::Auto` stands for, when it does not depend on the picture.
+    fixed_exposure: Option<f64>,
     pub white_balance: String,
 }
 
@@ -304,6 +308,107 @@ fn encode(l: f64) -> f64 {
 fn encode_with(l: f64, tone: f64) -> f64 {
     let e = srgb_encode(l.clamp(0.0, 1.0));
     e + tone * (e * e * (3.0 - 2.0 * e) - e)
+}
+
+/// Exposure that "auto" means for the sd Quattro (CAMERAID 40): Photo Pro does not meter the
+/// picture, it develops every file with the same gain. Against its TIFFs of three files (a bright
+/// street, a sky-filled one and a dark scene) the exposure that fits best was +1.00, +1.00 and
+/// +1.02 EV, while matching the camera's JPEG gave +1.30, +1.20 and -0.08. With the fixed value the
+/// RMS error (/255) fell from 16.5, 10.5 and 15.1 to 10.4, 7.3 and 8.1. Other cameras keep
+/// matching the JPEG; they were not measured.
+const SD_QUATTRO_EXPOSURE_EV: f64 = 1.0;
+
+/// Photo Pro's tone curve as measured on the sd Quattro at `SD_QUATTRO_EXPOSURE_EV`: the median
+/// of its encoded channel value (0..255) against our linear value before the curve (log2, centres
+/// of half-stop bins), pooled over the same three files. Compared with the sRGB curve with a mild S
+/// (strength 0.5) it is 6-10 levels darker in the shadows (the blacks of ours were lifted, which
+/// is why the picture looked flat), 3-6 lighter in the mid-tones and 8-16 lower at the top.
+const SD_QUATTRO_TONE: [(f64, f64); 17] = [
+    (-8.25, 4.0),
+    (-7.75, 5.0),
+    (-7.25, 6.0),
+    (-6.75, 9.0),
+    (-6.25, 12.0),
+    (-5.75, 17.0),
+    (-5.25, 23.0),
+    (-4.75, 32.0),
+    (-4.25, 44.0),
+    (-3.75, 60.0),
+    (-3.25, 81.0),
+    (-2.75, 106.0),
+    (-2.25, 132.0),
+    (-1.75, 159.0),
+    (-1.25, 184.0),
+    (-0.75, 207.0),
+    (-0.25, 228.0),
+];
+/// Where a fully saturated sensor value ends up (Photo Pro's skies read 251-253).
+const SD_QUATTRO_WHITE: f64 = 252.0;
+
+/// Monotone cubic (Fritsch-Carlson) interpolation through `nodes`, extended to both ends.
+fn monotone_cubic(nodes: &[(f64, f64)], x: f64) -> f64 {
+    let n = nodes.len();
+    let h: Vec<f64> = (0..n - 1).map(|i| nodes[i + 1].0 - nodes[i].0).collect();
+    let d: Vec<f64> = (0..n - 1)
+        .map(|i| (nodes[i + 1].1 - nodes[i].1) / h[i])
+        .collect();
+    let mut m = vec![0.0; n];
+    m[0] = d[0];
+    m[n - 1] = d[n - 2];
+    for i in 1..n - 1 {
+        m[i] = if d[i - 1] * d[i] <= 0.0 {
+            0.0
+        } else {
+            let w = (h[i - 1] + 2.0 * h[i], 2.0 * h[i - 1] + h[i]);
+            (w.0 + w.1) / (w.0 / d[i - 1] + w.1 / d[i])
+        };
+    }
+    let i = nodes.partition_point(|n| n.0 <= x).clamp(1, n - 1) - 1;
+    let t = (x - nodes[i].0) / h[i];
+    let (t2, t3) = (t * t, t * t * t);
+    (2.0 * t3 - 3.0 * t2 + 1.0) * nodes[i].1
+        + (t3 - 2.0 * t2 + t) * h[i] * m[i]
+        + (-2.0 * t3 + 3.0 * t2) * nodes[i + 1].1
+        + (t3 - t2) * h[i] * m[i + 1]
+}
+
+/// Photo Pro's sd Quattro curve for a linear value `l` in 0..=1, encoded 0..=1.
+fn sd_quattro_curve(l: f64) -> f64 {
+    if l <= 0.0 {
+        return 0.0;
+    }
+    let first = SD_QUATTRO_TONE[0];
+    let x = l.log2();
+    let y = if x < first.0 {
+        // Below the measured range the curve is a straight line to black.
+        first.1 * 2f64.powf(x - first.0)
+    } else {
+        let mut nodes = SD_QUATTRO_TONE.to_vec();
+        nodes.push((0.0, SD_QUATTRO_WHITE));
+        monotone_cubic(&nodes, x.min(0.0))
+    };
+    (y / 255.0).clamp(0.0, 1.0)
+}
+
+/// `encode_with` for the sd Quattro: the strength moves the curve between plain sRGB (0) and
+/// Photo Pro's (`TONE_STRENGTH`, the default), and beyond it for more contrast.
+fn encode_sd_quattro(l: f64, tone: f64) -> f64 {
+    let e = srgb_encode(l.clamp(0.0, 1.0));
+    (e + tone / TONE_STRENGTH * (sd_quattro_curve(l.clamp(0.0, 1.0)) - e)).clamp(0.0, 1.0)
+}
+
+/// Linear light for every 16 bit sRGB-encoded value.
+fn srgb_decoding() -> Vec<f32> {
+    (0..=u16::MAX)
+        .map(|v| {
+            let e = v as f64 / 65535.0;
+            (if e <= 0.04045 {
+                e / 12.92
+            } else {
+                ((e + 0.055) / 1.055).powf(2.4)
+            }) as f32
+        })
+        .collect()
 }
 
 fn srgb_encode(l: f64) -> f64 {
@@ -331,6 +436,19 @@ fn canonical_wb(name: &str) -> &str {
 /// (CAMERAID 40) was measured; the sd Quattro H keeps its Auto.
 fn is_sd_quattro_auto(camf: &Camf) -> bool {
     camf.number("CAMERAID") == Some(40.0) && camf.number("WhiteBalance") == Some(1.0)
+}
+
+/// sd Quattro (CAMERAID 40) greens come out yellow: against Photo Pro's TIFFs of three files
+/// (sky, street, dark scene) the hue of foliage is 5-8 degrees towards yellow. The red channel of
+/// the finished picture is corrected as `R + a (G - R) + b (B - R)` with a = -0.20 and b = +0.12,
+/// i.e. the row below, in linear light (it sums to 1, so neutrals stay put). The strength is the
+/// one that brings the green hue to within 3.5 degrees of Photo Pro's in all three files; the
+/// error metric hardly moves with it. The same correction on the blue row did not help, and a full
+/// 3x3 fit overfitted. Only the sd Quattro at 5000 K sunlight was measured.
+const SD_QUATTRO_RED_ROW: [f64; 3] = [1.08, -0.20, 0.12];
+
+fn is_sd_quattro(camf: &Camf) -> bool {
+    camf.number("CAMERAID") == Some(40.0)
 }
 
 fn wb_from_code(code: u32) -> &'static str {
@@ -466,9 +584,22 @@ impl Developer {
                 *m = iso * cc[i * 3 + j] * gain[j];
             }
         }
-        let curve = (0..=CURVE_SIZE)
-            .map(|i| encode_with(i as f64 / CURVE_SIZE as f64, tuning.tone) * 65535.0)
+        let sd_quattro = is_sd_quattro(camf);
+        let mut curve: Vec<f64> = (0..=CURVE_SIZE)
+            .map(|i| {
+                let l = i as f64 / CURVE_SIZE as f64;
+                let e = if sd_quattro {
+                    encode_sd_quattro(l, tuning.tone)
+                } else {
+                    encode_with(l, tuning.tone)
+                };
+                e * 65535.0
+            })
             .collect();
+        // A strength above the default can bend the sd Quattro curve backwards; never let it.
+        for i in 1..curve.len() {
+            curve[i] = curve[i].max(curve[i - 1]);
+        }
         Ok(Developer {
             black,
             white: [max; 3],
@@ -476,8 +607,15 @@ impl Developer {
             curve,
             gain: [1.0; 3],
             tone: tuning.tone,
+            red_row: sd_quattro.then(|| (SD_QUATTRO_RED_ROW, srgb_decoding())),
+            fixed_exposure: sd_quattro.then_some(SD_QUATTRO_EXPOSURE_EV),
             white_balance: name,
         })
+    }
+
+    /// The exposure that "auto" means for this camera when it does not depend on the picture.
+    pub fn fixed_exposure(&self) -> Option<f64> {
+        self.fixed_exposure
     }
 
     /// The tone curve strength this developer was built with.
@@ -577,6 +715,10 @@ impl Developer {
                 let i = (pos as usize).min(CURVE_SIZE - 1);
                 let f = pos - i as f64;
                 *out = (self.curve[i] * (1.0 - f) + self.curve[i + 1] * f).round() as u16;
+            }
+            if let Some((row, decode)) = &self.red_row {
+                let l: f64 = (0..3).map(|k| row[k] * decode[px[k] as usize] as f64).sum();
+                px[0] = (srgb_encode(l.clamp(0.0, 1.0)) * 65535.0).round() as u16;
             }
         }
     }
@@ -1155,5 +1297,119 @@ mod tests {
         let mut px = [1000, 1000, 50];
         d.transfer_detail(&mut px, 50);
         assert_eq!(px, [1000, 1000, 50]);
+    }
+
+    /// The sd Quattro developer applied to one raw pixel (black 100, white 4095), with or without
+    /// the red-row correction.
+    fn develop_pixel(px: [u16; 3], corrected: bool) -> [u16; 3] {
+        // Sunlight white balance, and the exposure the tests were written for.
+        let tuning = Tuning {
+            white_balance: Some("Sunlight"),
+            ..Tuning::default()
+        };
+        let mut d = Developer::new(&raw(), &with_camera(40.0), None, &tuning).unwrap();
+        d.set_exposure_ev([0.0; 3]);
+        if !corrected {
+            d.red_row = None;
+        }
+        let mut row = px;
+        d.apply(&mut row);
+        row
+    }
+
+    /// Raw pixel at `level` in green and blue whose red the test's Merrill trim (x1.04) brings to
+    /// the same level (black is 100).
+    fn neutral(level: u16) -> [u16; 3] {
+        [
+            100 + ((level as f64 - 100.0) / MERRILL_RED_TRIM).round() as u16,
+            level,
+            level,
+        ]
+    }
+
+    #[test]
+    fn sd_quattro_red_row_keeps_neutrals_and_leaves_green_and_blue_alone() {
+        let red_row_sum: f64 = SD_QUATTRO_RED_ROW.iter().sum();
+        assert!((red_row_sum - 1.0).abs() < 1e-12);
+        // A raw pixel that comes out neutral still does with the correction.
+        let plain = develop_pixel(neutral(2000), false);
+        assert!(plain[0].abs_diff(plain[1]) <= 2, "{plain:?}");
+        let gray = develop_pixel(neutral(2000), true);
+        assert!(
+            gray.iter().zip(plain).all(|(a, b)| a.abs_diff(b) <= 2),
+            "{gray:?} vs {plain:?}"
+        );
+        let green = develop_pixel([800, 2600, 1000], true);
+        let plain = develop_pixel([800, 2600, 1000], false);
+        assert_eq!(green[1], plain[1]);
+        assert_eq!(green[2], plain[2]);
+    }
+
+    #[test]
+    fn sd_quattro_red_row_moves_greens_away_from_yellow() {
+        // Yellow-green: red is high next to green. The correction takes red down.
+        let green = develop_pixel([1800, 2600, 800], true);
+        let plain = develop_pixel([1800, 2600, 800], false);
+        assert!(green[0] < plain[0], "{green:?} vs {plain:?}");
+        // A neutral pixel keeps its red, to rounding.
+        let flat = develop_pixel(neutral(1500), true);
+        let plain = develop_pixel(neutral(1500), false);
+        assert!(flat[0].abs_diff(plain[0]) <= 2, "{flat:?} vs {plain:?}");
+    }
+
+    #[test]
+    fn sd_quattro_auto_exposure_is_fixed_and_other_cameras_are_not() {
+        let sd = Developer::new(&raw(), &with_camera(40.0), None, &Tuning::default()).unwrap();
+        assert_eq!(sd.fixed_exposure(), Some(SD_QUATTRO_EXPOSURE_EV));
+        for camera in [41.0, 83.0, 78.0] {
+            let d = Developer::new(&raw(), &with_camera(camera), None, &Tuning::default()).unwrap();
+            assert_eq!(d.fixed_exposure(), None, "camera {camera}");
+        }
+        let none = Developer::new(&raw(), &camf(1.0), None, &Tuning::default()).unwrap();
+        assert_eq!(none.fixed_exposure(), None);
+    }
+
+    #[test]
+    fn monotone_cubic_passes_through_its_nodes_and_never_overshoots() {
+        let nodes = [(0.0, 0.0), (1.0, 1.0), (2.0, 1.1), (3.0, 5.0)];
+        for &(x, y) in &nodes {
+            assert!((monotone_cubic(&nodes, x) - y).abs() < 1e-12);
+        }
+        let mut last = f64::MIN;
+        for i in 0..=300 {
+            let v = monotone_cubic(&nodes, i as f64 / 100.0);
+            assert!(v >= last - 1e-12, "not monotone at {i}");
+            assert!((0.0..=5.0).contains(&v));
+            last = v;
+        }
+    }
+
+    #[test]
+    fn sd_quattro_curve_follows_the_measured_table() {
+        for &(x, y) in &SD_QUATTRO_TONE {
+            let got = sd_quattro_curve(2f64.powf(x)) * 255.0;
+            assert!((got - y).abs() < 0.01, "log2 {x}: {got} vs {y}");
+        }
+        assert_eq!(sd_quattro_curve(0.0), 0.0);
+        assert!((sd_quattro_curve(1.0) * 255.0 - SD_QUATTRO_WHITE).abs() < 1e-9);
+        // Black stays black, and the shadows are darker than plain sRGB's.
+        let shadow = 2f64.powf(-5.0);
+        assert!(sd_quattro_curve(shadow) < srgb_encode(shadow) * 0.6);
+    }
+
+    #[test]
+    fn sd_quattro_tone_strength_runs_from_plain_srgb_through_photo_pros_curve() {
+        for l in [0.001, 0.02, 0.18, 0.5, 0.9] {
+            assert!((encode_sd_quattro(l, 0.0) - srgb_encode(l)).abs() < 1e-12);
+            assert!((encode_sd_quattro(l, TONE_STRENGTH) - sd_quattro_curve(l)).abs() < 1e-12);
+        }
+        // The finished lookup table never goes backwards, even at the strongest setting.
+        let tuning = Tuning {
+            tone: 1.0,
+            ..Tuning::default()
+        };
+        let d = Developer::new(&raw(), &with_camera(40.0), None, &tuning).unwrap();
+        assert!(d.curve.windows(2).all(|w| w[1] >= w[0]));
+        assert_eq!(d.curve[0], 0.0);
     }
 }
