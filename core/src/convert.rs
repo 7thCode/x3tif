@@ -3,7 +3,7 @@
 use crate::camf::{Camf, Value};
 use crate::develop::{self, Developer, Exposure, Mode};
 use crate::exif::{self, PreviewExif};
-use crate::sharpen;
+use crate::finish::Finisher;
 use crate::tiff::{self, Compression, Exif, Metadata};
 use crate::x3f::{Error, Properties, Raw, X3f};
 use std::io::{self, Write};
@@ -162,10 +162,10 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W, mode: Mode) -> Result<(
                 finish(row);
             };
             if developer.is_some() {
-                // The developed picture is sharpened; the raw one stays as the sensor read it.
-                let mut sharpener = sharpen::Sharpener::new(area.width, area.height);
+                // The developed picture is finished; the raw one stays as the sensor read it.
+                let mut finisher = Finisher::new(area.width, area.height);
                 tiff::write_rgb16(out, area.width, area.height, &meta, |y, row| {
-                    sharpener.row(y, &mut develop_row, row)
+                    finisher.row(y, &mut develop_row, row)
                 })?;
             } else {
                 tiff::write_rgb16(out, area.width, area.height, &meta, &mut develop_row)?;
