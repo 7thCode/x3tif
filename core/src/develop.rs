@@ -288,6 +288,10 @@ pub struct Developer {
 const CURVE_SIZE: usize = 4096;
 /// Normalised raw level where the highlight blend towards white begins.
 const CLIP_START: f64 = 0.9;
+/// Limits of the blue-layer detail ratio applied to red and green (see `transfer_detail`).
+const DETAIL_RATIO: (f64, f64) = (0.25, 4.0);
+/// Blue level, as a fraction of its range, below which the detail correction fades out.
+const DETAIL_FLOOR: f64 = 0.02;
 /// How far the S-shaped tone curve is mixed in (0 = plain sRGB).
 const TONE_STRENGTH: f64 = 0.5;
 
@@ -522,6 +526,30 @@ impl Developer {
             }
         }
         (lo + hi) / 2.0
+    }
+
+    /// Gives a Quattro pixel's red and green the fine detail of the blue layer.
+    ///
+    /// The red and green layers have a quarter of the pixels of the blue one, so interpolated they
+    /// are softer than blue, and every edge gets a coloured fringe. `px` is the pixel as
+    /// interpolated (blue at full resolution) and `blue_low` is blue as the other layers see it
+    /// (averaged to their grid and interpolated the same way). Scaling red and green by the ratio
+    /// of the two keeps the local colour and moves the blue layer's brightness detail onto them.
+    /// Where blue is nearly black the ratio is mostly noise, so the correction fades out there.
+    pub fn transfer_detail(&self, px: &mut [u16], blue_low: u16) {
+        let range = self.white[2] - self.black[2];
+        let low = blue_low as f64 - self.black[2];
+        let full = px[2] as f64 - self.black[2];
+        if low <= 0.0 || range <= 0.0 {
+            return;
+        }
+        let ratio = (full / low).clamp(DETAIL_RATIO.0, DETAIL_RATIO.1);
+        let weight = low / (low + DETAIL_FLOOR * range);
+        let scale = 1.0 + (ratio - 1.0) * weight;
+        for (c, v) in px.iter_mut().take(2).enumerate() {
+            let scaled = (*v as f64 - self.black[c]) * scale + self.black[c];
+            *v = scaled.round().clamp(0.0, u16::MAX as f64) as u16;
+        }
     }
 
     /// Converts one row of interleaved raw RGB (sensor units) in place.
@@ -1067,5 +1095,65 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, Error::MissingCalibration(_)));
+    }
+
+    fn detail_developer() -> Developer {
+        Developer::new(&raw(), &camf(1.0), None, &Tuning::default()).unwrap()
+    }
+
+    /// Blue level `f` of the way from black to white, in raw units.
+    fn blue_at(d: &Developer, f: f64) -> u16 {
+        (d.black[2] + f * (d.white[2] - d.black[2])).round() as u16
+    }
+
+    #[test]
+    fn detail_transfer_leaves_flat_areas_alone() {
+        let d = detail_developer();
+        let b = blue_at(&d, 0.5);
+        let mut px = [1500, 2200, b];
+        d.transfer_detail(&mut px, b);
+        assert_eq!(px, [1500, 2200, b]);
+    }
+
+    #[test]
+    fn detail_transfer_follows_the_blue_layers_brightness() {
+        let d = detail_developer();
+        let (r, g) = (1500u16, 2200u16);
+        // Brighter than the blue seen by the other layers: red and green rise, in proportion.
+        let mut px = [r, g, blue_at(&d, 0.6)];
+        d.transfer_detail(&mut px, blue_at(&d, 0.4));
+        assert!(px[0] > r && px[1] > g);
+        let (rise_r, rise_g) = (
+            (px[0] as f64 - d.black[0]) / (r as f64 - d.black[0]),
+            (px[1] as f64 - d.black[1]) / (g as f64 - d.black[1]),
+        );
+        assert!((rise_r - rise_g).abs() < 0.01, "{rise_r} vs {rise_g}");
+        // Darker: they fall. Blue itself is never touched.
+        let mut px = [r, g, blue_at(&d, 0.2)];
+        d.transfer_detail(&mut px, blue_at(&d, 0.4));
+        assert!(px[0] < r && px[1] < g);
+        assert_eq!(px[2], blue_at(&d, 0.2));
+    }
+
+    #[test]
+    fn detail_transfer_is_limited_and_fades_in_the_dark() {
+        let d = detail_developer();
+        // A huge jump is capped at the ratio limit.
+        let mut px = [1000, 1000, blue_at(&d, 1.0)];
+        d.transfer_detail(&mut px, blue_at(&d, 0.1));
+        let gain = (px[0] as f64 - d.black[0]) / (1000.0 - d.black[0]);
+        assert!(gain <= DETAIL_RATIO.1 + 1e-9, "{gain}");
+        // Where blue is almost black the ratio is noise: the change is much smaller than in
+        // the bright case for the same ratio.
+        let dark = |f: f64| {
+            let mut px = [1000, 1000, blue_at(&d, f * 2.0)];
+            d.transfer_detail(&mut px, blue_at(&d, f));
+            (px[0] as f64 - 1000.0).abs()
+        };
+        assert!(dark(0.002) < dark(0.3) / 4.0);
+        // Blue at or below black: nothing to go by, nothing changes.
+        let mut px = [1000, 1000, 50];
+        d.transfer_detail(&mut px, 50);
+        assert_eq!(px, [1000, 1000, 50]);
     }
 }
