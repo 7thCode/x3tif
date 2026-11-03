@@ -5,5 +5,6 @@ pub mod exif;
 pub mod icc;
 pub mod png;
 pub mod preview;
+pub mod sharpen;
 pub mod tiff;
 pub mod x3f;

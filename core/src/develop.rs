@@ -282,6 +282,8 @@ pub struct Developer {
     /// Per-channel linear gain applied before the curve (2^EV).
     gain: [f64; 3],
     tone: f64,
+    /// Red-row correction applied to the finished picture, with the sRGB decoding it needs.
+    red_row: Option<([f64; 3], Vec<f32>)>,
     pub white_balance: String,
 }
 
@@ -304,6 +306,20 @@ fn encode(l: f64) -> f64 {
 fn encode_with(l: f64, tone: f64) -> f64 {
     let e = srgb_encode(l.clamp(0.0, 1.0));
     e + tone * (e * e * (3.0 - 2.0 * e) - e)
+}
+
+/// Linear light for every 16 bit sRGB-encoded value.
+fn srgb_decoding() -> Vec<f32> {
+    (0..=u16::MAX)
+        .map(|v| {
+            let e = v as f64 / 65535.0;
+            (if e <= 0.04045 {
+                e / 12.92
+            } else {
+                ((e + 0.055) / 1.055).powf(2.4)
+            }) as f32
+        })
+        .collect()
 }
 
 fn srgb_encode(l: f64) -> f64 {
@@ -331,6 +347,19 @@ fn canonical_wb(name: &str) -> &str {
 /// (CAMERAID 40) was measured; the sd Quattro H keeps its Auto.
 fn is_sd_quattro_auto(camf: &Camf) -> bool {
     camf.number("CAMERAID") == Some(40.0) && camf.number("WhiteBalance") == Some(1.0)
+}
+
+/// sd Quattro (CAMERAID 40) greens come out yellow: against Photo Pro's TIFFs of three files
+/// (sky, street, dark scene) the hue of foliage is 5-8 degrees towards yellow. The red channel of
+/// the finished picture is corrected as `R + a (G - R) + b (B - R)` with a = -0.20 and b = +0.12,
+/// i.e. the row below, in linear light (it sums to 1, so neutrals stay put). The strength is the
+/// one that brings the green hue to within 3.5 degrees of Photo Pro's in all three files; the
+/// error metric hardly moves with it. The same correction on the blue row did not help, and a full
+/// 3x3 fit overfitted. Only the sd Quattro at 5000 K sunlight was measured.
+const SD_QUATTRO_RED_ROW: [f64; 3] = [1.08, -0.20, 0.12];
+
+fn is_sd_quattro(camf: &Camf) -> bool {
+    camf.number("CAMERAID") == Some(40.0)
 }
 
 fn wb_from_code(code: u32) -> &'static str {
@@ -476,6 +505,7 @@ impl Developer {
             curve,
             gain: [1.0; 3],
             tone: tuning.tone,
+            red_row: is_sd_quattro(camf).then(|| (SD_QUATTRO_RED_ROW, srgb_decoding())),
             white_balance: name,
         })
     }
@@ -577,6 +607,10 @@ impl Developer {
                 let i = (pos as usize).min(CURVE_SIZE - 1);
                 let f = pos - i as f64;
                 *out = (self.curve[i] * (1.0 - f) + self.curve[i + 1] * f).round() as u16;
+            }
+            if let Some((row, decode)) = &self.red_row {
+                let l: f64 = (0..3).map(|k| row[k] * decode[px[k] as usize] as f64).sum();
+                px[0] = (srgb_encode(l.clamp(0.0, 1.0)) * 65535.0).round() as u16;
             }
         }
     }
@@ -1155,5 +1189,59 @@ mod tests {
         let mut px = [1000, 1000, 50];
         d.transfer_detail(&mut px, 50);
         assert_eq!(px, [1000, 1000, 50]);
+    }
+
+    /// The same developer for a camera, applied to one raw pixel (black 100, white 4095).
+    fn develop_pixel(camera: f64, px: [u16; 3]) -> [u16; 3] {
+        // Both cameras develop with the same (Sunlight) white balance, so only the correction differs.
+        let tuning = Tuning {
+            white_balance: Some("Sunlight"),
+            ..Tuning::default()
+        };
+        let mut d = Developer::new(&raw(), &with_camera(camera), None, &tuning).unwrap();
+        d.set_exposure_ev([0.0; 3]);
+        let mut row = px;
+        d.apply(&mut row);
+        row
+    }
+
+    /// Raw pixel at `level` in green and blue whose red the test's Merrill trim (x1.04) brings to
+    /// the same level (black is 100).
+    fn neutral(level: u16) -> [u16; 3] {
+        [
+            100 + ((level as f64 - 100.0) / MERRILL_RED_TRIM).round() as u16,
+            level,
+            level,
+        ]
+    }
+
+    #[test]
+    fn sd_quattro_red_row_keeps_neutrals_and_leaves_green_and_blue_alone() {
+        let red_row_sum: f64 = SD_QUATTRO_RED_ROW.iter().sum();
+        assert!((red_row_sum - 1.0).abs() < 1e-12);
+        // A raw pixel that comes out neutral without the correction still does with it.
+        let plain = develop_pixel(83.0, neutral(2000));
+        assert!(plain[0].abs_diff(plain[1]) <= 2, "{plain:?}");
+        let gray = develop_pixel(40.0, neutral(2000));
+        assert!(
+            gray.iter().zip(plain).all(|(a, b)| a.abs_diff(b) <= 2),
+            "{gray:?} vs {plain:?}"
+        );
+        let green = develop_pixel(40.0, [800, 2600, 1000]);
+        let plain = develop_pixel(83.0, [800, 2600, 1000]);
+        assert_eq!(green[1], plain[1]);
+        assert_eq!(green[2], plain[2]);
+    }
+
+    #[test]
+    fn sd_quattro_red_row_moves_greens_away_from_yellow() {
+        // Yellow-green: red is high next to green. The correction takes red down.
+        let green = develop_pixel(40.0, [1800, 2600, 800]);
+        let plain = develop_pixel(83.0, [1800, 2600, 800]);
+        assert!(green[0] < plain[0], "{green:?} vs {plain:?}");
+        // A neutral pixel keeps its red, to rounding.
+        let flat = develop_pixel(40.0, neutral(1500));
+        let plain = develop_pixel(83.0, neutral(1500));
+        assert!(flat[0].abs_diff(plain[0]) <= 2, "{flat:?} vs {plain:?}");
     }
 }
