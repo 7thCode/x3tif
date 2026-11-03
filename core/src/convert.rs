@@ -340,6 +340,8 @@ fn metadata(props: &Properties, camf: &Camf, preview: &PreviewExif, output: &Out
         compression: Compression::Deflate,
         exif: exif(props, camf, preview),
         xmp: Some(xmp(props, camf, output)),
+        // Only the developed picture is sRGB; raw values are the sensor's own and stay untagged.
+        icc_profile: matches!(output, Output::Developed(..)).then(crate::icc::srgb),
     }
 }
 
