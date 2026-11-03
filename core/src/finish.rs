@@ -24,7 +24,7 @@
 //! **Luminance grain.** The sd Quattro is developed with a fixed +1 EV, which lifts dark scenes by
 //! a stop or more and with them their noise: in the dark file the flat-area luminance noise was
 //! 2.6x Photo Pro's (2.93 vs 1.13 in /255), with the sharpening's Nyquist response at 1.39. Luminance
-//! detail below 2/255 (`CORE`, a soft threshold on the difference to the blurred luminance) is
+//! detail below 2/255 at first, 3/255 now (`CORE`, a soft threshold on the difference to the blurred luminance) is
 //! removed where the sharpening fades out: noise 1.99, response 0.92; in the bright file
 //! 6.74 -> 6.52 (Photo Pro 5.34), response 0.96 -> 0.91. Larger values cost more texture than they
 //! remove grain.
@@ -35,22 +35,28 @@
 //! of the three references 6.52/6.12/1.99 -> about 5.4/4.9/1.0 (Photo Pro 5.34/6.15/1.13), sharp
 //! response unchanged or up (0.91/0.86/0.92 -> 0.94/0.90/0.90), bokeh luminance 3.19 -> 2.9
 //! (Photo Pro 2.26).
+//!
+//! **Second round, after "still coarse everywhere".** Raising `MID_CORE` from 3 to 10/255 only took
+//! the bokeh from 2.88 to 2.79 and moved the result away from Photo Pro (RMS vs Photo Pro of the
+//! bright file 8.25 -> 8.92), so it went to 5. The grain left was pixel-sized: raising `CORE` from 2
+//! to 3/255 took the bokeh of 2.81 to 2.34 (Photo Pro 2.26) at the cost of the dark file's sharp
+//! response, 0.90 -> 0.77; 4/255 would be 1.98 and 0.70.
 
 const CHROMA_SIGMA: f64 = 7.0;
 const CHROMA_RADIUS: usize = 21; // 3 sigma
 /// Blur that separates the mid-frequency band (a few pixels) from the low frequencies.
 const WIDE_SIGMA: f64 = 2.5;
 const WIDE_RADIUS: usize = 8;
-/// Luminance of that band below this (levels of 65535, = 3/255) is removed everywhere.
-const MID_CORE: f32 = 3.0 * 257.0;
+/// Luminance of that band below this (levels of 65535, = 5/255) is removed everywhere.
+const MID_CORE: f32 = 5.0 * 257.0;
 const SHARP_SIGMA: f64 = 0.8;
 const SHARP_RADIUS: usize = 2;
 const AMOUNT: f32 = 1.2;
 /// Encoded levels (0..65535) of the blurred luminance between which the amount fades in.
 const FADE: (f32, f32) = (0.15 * 65535.0, 0.45 * 65535.0);
-/// Luminance detail smaller than this (levels of 65535, = 2/255) is removed in dark areas, with the
+/// Luminance detail smaller than this (levels of 65535, = 3/255) is removed in dark and medium-dark areas, with the
 /// same fade as the sharpening turned around: 0 where the sharpening is full.
-const CORE: f32 = 2.0 * 257.0;
+const CORE: f32 = 3.0 * 257.0;
 /// Rows kept: the one being written and `CHROMA_RADIUS` on each side.
 const WINDOW: usize = 2 * CHROMA_RADIUS + 1;
 
