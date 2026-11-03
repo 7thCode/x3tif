@@ -45,10 +45,10 @@
 const CHROMA_SIGMA: f64 = 7.0;
 const CHROMA_RADIUS: usize = 21; // 3 sigma
 /// Blur that separates the mid-frequency band (a few pixels) from the low frequencies.
-const WIDE_SIGMA: f64 = 2.5;
-const WIDE_RADIUS: usize = 8;
-/// Luminance of that band below this (levels of 65535, = 5/255) is removed everywhere.
-const MID_CORE: f32 = 5.0 * 257.0;
+const WIDE_SIGMA: f64 = 3.5;
+const WIDE_RADIUS: usize = 11; // 3 sigma
+/// Luminance of that band below this (levels of 65535, = 6/255) is removed everywhere.
+const MID_CORE: f32 = 6.0 * 257.0;
 const SHARP_SIGMA: f64 = 0.8;
 const SHARP_RADIUS: usize = 2;
 const AMOUNT: f32 = 1.2;
