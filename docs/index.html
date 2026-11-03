@@ -3,10 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>x3tif — Foveon の素のデータを、そのまま TIFF に</title>
+    <title>x3tif — X3F を、見たままの TIFF に</title>
     <meta
       name="description"
-      content="Sigma Foveon の X3F(dp Merrill / dp Quattro / sd Quattro)を、現像せずに 16bit TIFF へ変換するデスクトップアプリ。ドロップして、プレビューを見ながら調整できます。"
+      content="Sigma Foveon の X3F(dp Merrill / dp Quattro / sd Quattro)を、見た目に近い仕上がりの 16bit TIFF へ変換するデスクトップアプリ。ドロップして、プレビューを見ながら調整できます。"
     />
     <meta name="color-scheme" content="dark" />
     <style>
@@ -344,10 +344,10 @@
       <div class="hero">
         <div>
           <div class="wordmark"><b>x3tif</b> &nbsp;·&nbsp; X3F → TIFF</div>
-          <h1><span style="white-space: nowrap">Foveon の<em>素のデータ</em>を、</span><br /><span style="white-space: nowrap">そのまま持ち出す。</span></h1>
+          <h1><span style="white-space: nowrap">X3F を、</span><br /><span style="white-space: nowrap"><em>見たまま</em>の TIFF に。</span></h1>
           <p class="lead">
-            Sigma の RAW(X3F)を、現像せずに 16bit の TIFF へ。ホワイトバランスも、色変換も、ガンマも、まだ何もかけません。
-            お気に入りの現像ソフトで、一から仕上げるための入り口です。
+            Sigma の RAW(X3F)を、見た目に近い仕上がりの 16bit TIFF へ。ホワイトバランス、露出、トーンはウィンドウで調整できます。
+            Quattro は、鮮鋭化と色・粒状感の抑制も入ります。センサーの素の値を書き出すモードもあります。
           </p>
           <div class="cta">
             <a class="btn" href="#download">ダウンロード</a>
@@ -361,7 +361,7 @@
             <div class="layer l-g"><span>MIDDLE · G</span></div>
             <div class="layer l-r"><span>BOTTOM · R</span></div>
           </div>
-          <div class="stack-caption">1 画素に 3 層。補間のない色情報をそのまま。</div>
+          <div class="stack-caption">1 画素に 3 層。補間のない色情報から仕上げる。</div>
         </div>
       </div>
     </div>
@@ -369,24 +369,24 @@
     <section>
       <div class="wrap">
         <h2>Why</h2>
-        <h3>現像の前の、いちばん素直な状態を残す。</h3>
+        <h3>撮ったときの見た目を、そのまま取り出す。</h3>
         <p class="muted" style="max-width: 36em">
           Foveon センサーは、1 画素の中に 3 層の受光層を重ねています。ベイヤー配列のような色の補間(デモザイク)がありません。
-          x3tif は、そのセンサーの値に手を加えず、広く読める TIFF に収めます。
+          x3tif は、そのセンサーの値を見た目に近い絵に仕上げ、広く読める TIFF に収めます。
         </p>
         <div class="grid3">
           <div class="card">
-            <h4>センサー値をそのまま</h4>
+            <h4>見たままの仕上がり</h4>
             <p>
-              16bit・3 チャンネルのリニア RGB。黒レベルの引き算も、ホワイトバランスも、トーンカーブも適用しません。
-              暗部のノイズフロアまで残ります。
+              ホワイトバランス、色変換、露出、トーンカーブを適用した 16bit の sRGB TIFF(ICC プロファイル付き)。
+              sd Quattro は Photo Pro に近い明るさとトーンに合わせています。
             </p>
           </div>
           <div class="card">
-            <h4>校正値も一緒に</h4>
+            <h4>粒状感の抑制と鮮鋭化</h4>
             <p>
-              WB ゲイン、色マトリクス、有効領域などのカメラ内の値は XMP に保存します。機種名、撮影日時、向き、絞り・露出時間・ISO などは
-              EXIF に入ります。
+              Quattro は輝度を鮮鋭化し、色ノイズと中域の粒状感を抑えます。WB ゲインなどの校正値は XMP に、機種名・撮影日時・絞り・
+              露出時間・ISO などは EXIF に保存します。
             </p>
           </div>
           <div class="card">
@@ -403,7 +403,7 @@
     <section>
       <div class="wrap">
         <h2>Workflow</h2>
-        <h3>いつもの現像ソフトに、橋をかける。</h3>
+        <h3>仕上げてから、いつもの環境へ。</h3>
         <div class="flow">
           <span class="chip">X3F</span><span class="arrow">→</span>
           <span class="chip hi">x3tif</span><span class="arrow">→</span>
@@ -411,8 +411,8 @@
           <span class="chip">Lightroom / Capture One / darktable など</span>
         </div>
         <p class="muted" style="margin-top: 24px; max-width: 38em">
-          TIFF は一般的な形式なので、Sigma 純正以外のソフトや、複数の現像ソフトを使い分ける環境にも持ち込めます。
-          現像の判断は、すべて受け取った側に残ります。
+          TIFF は一般的な形式なので、Sigma 純正以外のソフトにも持ち込めます。見たままで仕上げた TIFF をそのまま使うことも、
+          「生データ」で書き出して現像ソフトで一から仕上げることもできます。
         </p>
       </div>
     </section>
@@ -428,9 +428,9 @@
         </div>
         <dl class="spec">
           <dt>画像</dt>
-          <dd>16bit ・ 3 チャンネル ・ リニア RGB ・ TIFF(Deflate 圧縮、ロスレス)</dd>
+          <dd>16bit ・ 3 チャンネル ・ TIFF(Deflate 圧縮、ロスレス)。見たまま: sRGB ・ 生データ: リニア RGB</dd>
           <dt>処理</dt>
-          <dd>なし(黒レベル・WB・色変換・ガンマは未適用)</dd>
+          <dd>見たまま: 黒レベル・WB・色変換・露出・トーン・sRGB ガンマを適用(Quattro は鮮鋭化と粒状感の抑制も)。生データ: 適用なし</dd>
           <dt>メタデータ</dt>
           <dd>機種名 / 撮影日時 / 向き / EXIF(絞り・露出時間・ISO・露出補正・焦点距離) / XMP(PROP と CAMF の校正値)</dd>
           <dt>対象外</dt>
