@@ -19,6 +19,14 @@
 //! file the same mask more than doubled the noise (Photo Pro denoises there), so the amount fades
 //! out for dark areas: zero at an encoded level of 0.15, full at 0.45. It adds the same amount to
 //! every channel, so hues stay put.
+//!
+//! **Luminance grain.** The sd Quattro is developed with a fixed +1 EV, which lifts dark scenes by
+//! a stop or more and with them their noise: in the dark file the flat-area luminance noise was
+//! 2.6x Photo Pro's (2.93 vs 1.13 in /255), with the sharpening's Nyquist response at 1.39. Luminance
+//! detail below 2/255 (`CORE`, a soft threshold on the difference to the blurred luminance) is
+//! removed where the sharpening fades out: noise 1.99, response 0.92; in the bright file
+//! 6.74 -> 6.52 (Photo Pro 5.34), response 0.96 -> 0.91. Larger values cost more texture than they
+//! remove grain.
 
 const CHROMA_SIGMA: f64 = 4.0;
 const CHROMA_RADIUS: usize = 12; // 3 sigma
@@ -27,6 +35,9 @@ const SHARP_RADIUS: usize = 2;
 const AMOUNT: f32 = 1.2;
 /// Encoded levels (0..65535) of the blurred luminance between which the amount fades in.
 const FADE: (f32, f32) = (0.15 * 65535.0, 0.45 * 65535.0);
+/// Luminance detail smaller than this (levels of 65535, = 2/255) is removed in dark areas, with the
+/// same fade as the sharpening turned around: 0 where the sharpening is full.
+const CORE: f32 = 2.0 * 257.0;
 /// Rows kept: the one being written and `CHROMA_RADIUS` on each side.
 const WINDOW: usize = 2 * CHROMA_RADIUS + 1;
 
@@ -153,7 +164,9 @@ impl Finisher {
             let luma = (p[0] as f32 + p[1] as f32 + p[2] as f32) / 3.0;
             let blur = self.scratch[x];
             let t = ((blur - FADE.0) / (FADE.1 - FADE.0)).clamp(0.0, 1.0);
-            let y_out = luma + AMOUNT * t * t * (3.0 - 2.0 * t) * (luma - blur);
+            let d = luma - blur;
+            let d = d.signum() * (d.abs() - CORE * (1.0 - t * t * (3.0 - 2.0 * t))).max(0.0);
+            let y_out = blur + d * (1.0 + AMOUNT * t * t * (3.0 - 2.0 * t));
             for c in 0..3 {
                 out[x * 3 + c] = (y_out + self.acc[c][x]).round().clamp(0.0, 65535.0) as u16;
             }
@@ -230,7 +243,10 @@ mod tests {
             (hi as i32 - out[2][20 * 3] as i32).abs()
         };
         assert!(step(3000, 6000) < step(30000, 60000) / 10);
-        assert_eq!(step(1000, 2000), 0, "nothing at all in the deepest shadows");
+        // Nothing is sharpened in the deepest shadows: no overshoot (the grain removal may soften
+        // the edge by about one level of 255).
+        let out = run(40, 5, |x, _| if x < 20 { [1000; 3] } else { [2000; 3] });
+        assert!(out[2][20 * 3] <= 2000 && out[2][19 * 3] >= 1000);
     }
 
     #[test]
@@ -275,5 +291,23 @@ mod tests {
         assert_eq!(one[0], [100, 200, 300]);
         let thin = run(2, 2, |x, y| [(x * 1000 + y * 100) as u16; 3]);
         assert_eq!(thin.len(), 2);
+    }
+
+    #[test]
+    fn small_luminance_grain_is_removed_in_the_dark_but_not_in_the_light() {
+        let grain = |level: u16| {
+            let out = run(48, 48, |x, y| {
+                let v = if (x + y).is_multiple_of(2) {
+                    level + 300
+                } else {
+                    level - 300
+                };
+                [v; 3]
+            });
+            let p = &out[24][24 * 3..24 * 3 + 3];
+            (p[0] as i32 - level as i32).abs()
+        };
+        assert!(grain(8000) < 100, "dark grain is gone");
+        assert!(grain(50000) > 300, "bright detail is kept (and sharpened)");
     }
 }
