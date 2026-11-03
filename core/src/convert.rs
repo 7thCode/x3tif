@@ -196,6 +196,9 @@ pub(crate) fn exposure_for_target(
     raw: &Raw,
     area: &Area,
 ) -> [f64; 3] {
+    if let Some(ev) = developer.fixed_exposure() {
+        return [ev; 3];
+    }
     let Some(target) = target else {
         return [0.0; 3];
     };
