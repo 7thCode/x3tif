@@ -39,6 +39,18 @@ impl From<io::Error> for ConvertError {
 
 /// Converts an X3F file image (bytes) into a TIFF written to `out`.
 pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W, mode: Mode) -> Result<(), ConvertError> {
+    x3f_to_tiff_with_progress(data, out, mode, |_| {})
+}
+
+/// As `x3f_to_tiff`, and `progress` is called with the fraction (0..1) of the rows written so far:
+/// first with 0 once the file is decoded, then about every 64 rows, last with 1. Decoding itself
+/// has no steps to report.
+pub fn x3f_to_tiff_with_progress<W: Write>(
+    data: Vec<u8>,
+    out: &mut W,
+    mode: Mode,
+    mut progress: impl FnMut(f64),
+) -> Result<(), ConvertError> {
     let x3f = X3f::parse(data)?;
     let props = x3f.properties()?;
     // Metadata is best effort: an unreadable CAMF must not block the conversion.
@@ -102,9 +114,16 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W, mode: Mode) -> Result<(
         (None, s) => Output::Raw(1 << s),
     };
     let meta = metadata(&props, &camf, &preview, &output);
+    let rows = area.height;
+    let mut tick = |y: usize| {
+        if y.is_multiple_of(64) {
+            progress(y as f64 / rows as f64);
+        }
+    };
     match raw {
         Raw::Merrill { width, rgb, .. } => {
             tiff::write_rgb16(out, area.width, area.height, &meta, |y, row| {
+                tick(y);
                 let at = ((y + area.y) * width + area.x) * 3;
                 row.copy_from_slice(&rgb[at..at + area.width * 3]);
                 finish(row);
@@ -165,13 +184,18 @@ pub fn x3f_to_tiff<W: Write>(data: Vec<u8>, out: &mut W, mode: Mode) -> Result<(
                 // The developed picture is finished; the raw one stays as the sensor read it.
                 let mut finisher = Finisher::new(area.width, area.height);
                 tiff::write_rgb16(out, area.width, area.height, &meta, |y, row| {
+                    tick(y);
                     finisher.row(y, &mut develop_row, row)
                 })?;
             } else {
-                tiff::write_rgb16(out, area.width, area.height, &meta, &mut develop_row)?;
+                tiff::write_rgb16(out, area.width, area.height, &meta, |y, row| {
+                    tick(y);
+                    develop_row(y, row)
+                })?;
             }
         }
     }
+    progress(1.0);
     Ok(())
 }
 

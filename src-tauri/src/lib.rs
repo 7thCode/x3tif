@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
     time::SystemTime,
 };
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use x3tif_core::develop::{white_balance_name, Exposure, Mode, Tuning};
 use x3tif_core::preview::Loaded;
 
@@ -211,14 +211,15 @@ async fn preview(
     .map_err(|e| e.to_string())?
 }
 
-fn convert_file(input: &Path, mode: Mode) -> Result<PathBuf, String> {
+fn convert_file(input: &Path, mode: Mode, progress: impl FnMut(f64)) -> Result<PathBuf, String> {
     check_x3f(input)?;
     let data = fs::read(input).map_err(|e| format!("読み込めません: {e}"))?;
     let out = output_path(input);
     let tmp = out.with_extension("tif.part");
     let result = (|| {
         let mut w = BufWriter::new(File::create(&tmp).map_err(|e| format!("書き込めません: {e}"))?);
-        x3tif_core::convert::x3f_to_tiff(data, &mut w, mode).map_err(|e| e.to_string())?;
+        x3tif_core::convert::x3f_to_tiff_with_progress(data, &mut w, mode, progress)
+            .map_err(|e| e.to_string())?;
         std::io::Write::flush(&mut w).map_err(|e| format!("書き込めません: {e}"))?;
         drop(w);
         fs::rename(&tmp, &out).map_err(|e| format!("書き込めません: {e}"))
@@ -238,6 +239,12 @@ fn mode_for(developed: bool, exposure: Option<f64>, tuning: Tuning) -> Mode {
     }
 }
 
+#[derive(Clone, Serialize)]
+struct ProgressEvent<'a> {
+    path: &'a str,
+    fraction: f64,
+}
+
 /// `settings` are the adjustments on the screen; without them the saved defaults are used.
 #[tauri::command]
 async fn convert(
@@ -247,12 +254,26 @@ async fn convert(
     exposure: Option<f64>,
     settings: Option<Settings>,
 ) -> Result<String, String> {
-    let tuning = settings.unwrap_or_else(|| get_settings(app)).tuning();
+    let tuning = settings
+        .unwrap_or_else(|| get_settings(app.clone()))
+        .tuning();
     let mode = mode_for(developed, exposure, tuning);
-    tauri::async_runtime::spawn_blocking(move || convert_file(Path::new(&path), mode))
-        .await
-        .map_err(|e| e.to_string())?
-        .map(|p| p.to_string_lossy().into_owned())
+    tauri::async_runtime::spawn_blocking(move || {
+        // The screen shows the fraction on the file's row; a lost event only skips a step.
+        let progress = |fraction: f64| {
+            let _ = app.emit(
+                "convert-progress",
+                ProgressEvent {
+                    path: &path,
+                    fraction,
+                },
+            );
+        };
+        convert_file(Path::new(&path), mode, progress)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map(|p| p.to_string_lossy().into_owned())
 }
 
 pub fn run() {
@@ -406,8 +427,8 @@ mod tests {
         let d = temp_dir("bad");
         let bad = d.join("bad.x3f");
         fs::write(&bad, vec![0u8; 64]).unwrap();
-        assert!(convert_file(&bad, Mode::Raw).is_err());
-        assert!(convert_file(&d.join("note.txt"), Mode::Raw).is_err());
+        assert!(convert_file(&bad, Mode::Raw, |_| {}).is_err());
+        assert!(convert_file(&d.join("note.txt"), Mode::Raw, |_| {}).is_err());
         let left: Vec<_> = fs::read_dir(&d)
             .unwrap()
             .map(|e| e.unwrap().file_name())
@@ -426,13 +447,20 @@ mod tests {
         let input = d.join("sample.x3f");
         fs::copy(sample, &input).unwrap();
 
-        let out = convert_file(&input, Mode::Raw).unwrap();
+        let mut steps = Vec::new();
+        let out = convert_file(&input, Mode::Raw, |f| steps.push(f)).unwrap();
         assert_eq!(out, d.join("sample.tif"));
+        assert_eq!(steps.first(), Some(&0.0));
+        assert_eq!(steps.last(), Some(&1.0));
+        assert!(
+            steps.len() > 10 && steps.windows(2).all(|w| w[0] <= w[1]),
+            "{steps:?}"
+        );
         let head = fs::read(&out).unwrap();
         assert_eq!(&head[..4], b"II*\0");
         // A second conversion must not overwrite the first result.
         assert_eq!(
-            convert_file(&input, Mode::Raw).unwrap(),
+            convert_file(&input, Mode::Raw, |_| {}).unwrap(),
             d.join("sample-1.tif")
         );
         assert!(!d.join("sample.tif.part").exists());
