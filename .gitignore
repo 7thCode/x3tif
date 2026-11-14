@@ -2,3 +2,8 @@ target/
 node_modules/
 .DS_Store
 src-tauri/gen/
+
+# Claude Code(個人設定と他ツールの作業用ディレクトリ)
+.claude/settings.local.json
+.codex/
+.gemini/
