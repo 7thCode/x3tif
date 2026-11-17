@@ -526,9 +526,16 @@ const DP1_MERRILL_MEASURED: MeasuredTone = MeasuredTone {
 };
 
 impl MeasuredTone {
-    /// カーブが受け取るリニア値の上限。
+    /// 測ったカーブが白に届くリニア値。これより上は白のまま。
     fn max_linear(&self) -> f64 {
         2f64.powf(self.white.0)
+    }
+
+    /// 現像のカーブ表が受け取るリニア値の上限。白に届く点が 1 より下の機種(DP Merrill は
+    /// 2^-0.25)でも 1 までは取る。トーンを下げた(素の sRGB に寄せた)ときは、1 までの値が
+    /// 白でない出力になるので、そこで打ち切ると白が白にならない。
+    fn domain_max(&self) -> f64 {
+        self.max_linear().max(1.0)
     }
 
     /// リニア値 `l` に対する Photo Pro のエンコード値(0..=1)。
@@ -821,7 +828,7 @@ impl Developer {
         }
         let sd_quattro = is_sd_quattro(camf);
         let measured = measured_tone(camf);
-        let curve_max = measured.map_or(1.0, MeasuredTone::max_linear);
+        let curve_max = measured.map_or(1.0, MeasuredTone::domain_max);
         let mut curve: Vec<f64> = (0..=CURVE_SIZE)
             .map(|i| {
                 let l = i as f64 / CURVE_SIZE as f64 * curve_max;
@@ -2122,11 +2129,30 @@ mod tests {
     }
 
     #[test]
+    fn merrill_saturated_white_stays_white_at_any_tone_strength() {
+        // 測ったカーブは 2^-0.25 で白に届く。トーンを下げて素の sRGB に寄せたときも、
+        // 飽和した画素は白(65535)のまま。表が 2^-0.25 で打ち切られると 60719 になっていた。
+        for camera in [77.0, 78.0] {
+            for tone in [0.0, 0.1, TONE_STRENGTH, 1.0] {
+                let tuning = Tuning {
+                    tone,
+                    ..Tuning::default()
+                };
+                let d = Developer::new(&raw(), &with_camera(camera), None, &tuning).unwrap();
+                let mut row = [u16::MAX; 3];
+                d.apply(&mut row);
+                assert_eq!(row, [u16::MAX; 3], "camera {camera} tone {tone}");
+            }
+        }
+    }
+
+    #[test]
     fn dp1_merrill_auto_exposure_is_fixed_and_curve_follows_the_measured_table() {
         let d = Developer::new(&raw(), &with_camera(77.0), None, &Tuning::default()).unwrap();
         assert_eq!(d.fixed_exposure(), Some(DP1_MERRILL_EXPOSURE_EV));
         let m = &DP1_MERRILL_MEASURED;
-        assert!((d.curve_max - m.max_linear()).abs() < 1e-12);
+        assert!((m.max_linear() - 2f64.powf(-0.25)).abs() < 1e-12);
+        assert_eq!(d.curve_max, 1.0); // 白に届く点が 1 より下でも、表は 1 まで取る
         for &(x, y) in m.nodes {
             assert!((m.curve(2f64.powf(x)) * 255.0 - y).abs() < 1e-6, "{x}");
         }
