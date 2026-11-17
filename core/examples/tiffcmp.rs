@@ -1,6 +1,8 @@
 //! 検証用 CLI: 2 つの 16bit RGB TIFF を画素単位で比べる。
 //!
-//!   tiffcmp <reference.tif> <candidate.tif> [--grid N]
+//!   tiffcmp <reference.tif> <candidate.tif> [--grid N] [--bands]
+//!
+//! `--bands` は位置ずれ(高域の相互相関)と、輝度・色差の帯域別の振幅・相関・ゲインも出す。
 //!
 //! reference は SIGMA Photo Pro の出力、candidate は x3tif の出力を想定している。
 //! 画素値の差(一致率・最大誤差・RMSE・PSNR など)を主に報告し、TIFF タグの違いと、
@@ -559,12 +561,261 @@ fn maker_note_settings(t: &Tiff, exif: &BTreeMap<u16, Entry>) {
     }
 }
 
+/// 横・縦の順にガウスぼかしをかける(端は繰り返す)。`sigma` が 0 以下なら複製を返す。
+fn gauss_blur(src: &[f32], w: usize, h: usize, sigma: f64) -> Vec<f32> {
+    if sigma <= 0.0 {
+        return src.to_vec();
+    }
+    let r = (3.0 * sigma).ceil() as usize;
+    let mut k: Vec<f32> = (0..=2 * r)
+        .map(|i| {
+            let d = i as f64 - r as f64;
+            (-d * d / (2.0 * sigma * sigma)).exp() as f32
+        })
+        .collect();
+    let sum: f32 = k.iter().sum();
+    k.iter_mut().for_each(|v| *v /= sum);
+    let mut tmp = vec![0f32; w * h];
+    let mut padded = Vec::with_capacity(w + 2 * r);
+    for y in 0..h {
+        let row = &src[y * w..(y + 1) * w];
+        padded.clear();
+        padded.extend(std::iter::repeat_n(row[0], r));
+        padded.extend_from_slice(row);
+        padded.extend(std::iter::repeat_n(row[w - 1], r));
+        let out = &mut tmp[y * w..(y + 1) * w];
+        for (j, &kj) in k.iter().enumerate() {
+            for (d, s) in out.iter_mut().zip(&padded[j..]) {
+                *d += kj * s;
+            }
+        }
+    }
+    let mut dst = vec![0f32; w * h];
+    for y in 0..h {
+        let out = &mut dst[y * w..(y + 1) * w];
+        for (j, &kj) in k.iter().enumerate() {
+            let ys = (y as isize + j as isize - r as isize).clamp(0, h as isize - 1) as usize;
+            for (d, s) in out.iter_mut().zip(&tmp[ys * w..(ys + 1) * w]) {
+                *d += kj * s;
+            }
+        }
+    }
+    dst
+}
+
+/// 画像の 1 成分を /255 の単位で取り出す。0: 輝度 (R+G+B)/3、1: R−G、2: B−G、3/4/5: R/G/B。
+fn component(img: &Image, which: usize) -> Vec<f32> {
+    img.px
+        .chunks_exact(3)
+        .map(|p| {
+            let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
+            let v = match which {
+                0 => (r + g + b) / 3.0,
+                1 => r - g,
+                2 => b - g,
+                c => p[c - 3] as f32,
+            };
+            v / 257.0
+        })
+        .collect()
+}
+
+/// 位置ずれの測定。高域(元 − σ2.8 のぼかし)の正規化相互相関で、画像内 3x3 か所・R/G/B/輝度ごとに
+/// candidate の像が reference よりどれだけ右下へずれているかを ±3 画素・サブピクセルで求める。
+fn shift_report(reference: &Image, cand: &Image) {
+    const T: usize = 320;
+    const M: isize = 3;
+    let (w, h) = (reference.width, reference.height);
+    if w < T + 2 * M as usize || h < T + 2 * M as usize {
+        println!("\n画像が小さいので位置ずれは測りません");
+        return;
+    }
+    let highpass = |img: &Image, which: usize| {
+        let p = component(img, which);
+        let b = gauss_blur(&p, w, h, 2.8);
+        p.iter().zip(&b).map(|(a, b)| a - b).collect::<Vec<f32>>()
+    };
+    let names = ["輝度", "R", "G", "B"];
+    let which = [0usize, 3, 4, 5];
+    let rp: Vec<Vec<f32>> = which.iter().map(|&c| highpass(reference, c)).collect();
+    let cp: Vec<Vec<f32>> = which.iter().map(|&c| highpass(cand, c)).collect();
+    println!("\n== 位置ずれ(candidate − reference、画素。+x は右、+y は下。高域の相互相関 ±3 画素、括弧内は相関のピーク) ==");
+    for (fy, fx, place) in [
+        (0.15, 0.15, "左上"),
+        (0.15, 0.5, "上"),
+        (0.15, 0.85, "右上"),
+        (0.5, 0.15, "左"),
+        (0.5, 0.5, "中央"),
+        (0.5, 0.85, "右"),
+        (0.85, 0.15, "左下"),
+        (0.85, 0.5, "下"),
+        (0.85, 0.85, "右下"),
+    ] {
+        let x0 = ((w as f64 * fx) as usize).clamp(T / 2 + 3, w - T / 2 - 3) - T / 2;
+        let y0 = ((h as f64 * fy) as usize).clamp(T / 2 + 3, h - T / 2 - 3) - T / 2;
+        let mut cells = Vec::new();
+        for (name, (a, b)) in names.iter().zip(rp.iter().zip(&cp)) {
+            // 相関 c[dy][dx](dx, dy は -3..=3)。
+            let mut c = [[0f64; 7]; 7];
+            let (mut aa, mut bb) = (0f64, 0f64);
+            for y in y0..y0 + T {
+                for x in x0..x0 + T {
+                    aa += (a[y * w + x] as f64).powi(2);
+                    bb += (b[y * w + x] as f64).powi(2);
+                }
+            }
+            for (iy, row) in c.iter_mut().enumerate() {
+                for (ix, v) in row.iter_mut().enumerate() {
+                    let (dx, dy) = (ix as isize - M, iy as isize - M);
+                    let mut s = 0f64;
+                    for y in y0 + M as usize..y0 + T - M as usize {
+                        let by = (y as isize + dy) as usize;
+                        for x in x0 + M as usize..x0 + T - M as usize {
+                            s +=
+                                a[y * w + x] as f64 * b[by * w + (x as isize + dx) as usize] as f64;
+                        }
+                    }
+                    *v = s / (aa * bb).sqrt().max(1e-12);
+                }
+            }
+            let (mut best, mut bx, mut by) = (f64::MIN, 0usize, 0usize);
+            for (iy, row) in c.iter().enumerate() {
+                for (ix, &v) in row.iter().enumerate() {
+                    if v > best {
+                        (best, bx, by) = (v, ix, iy);
+                    }
+                }
+            }
+            let sub = |m: f64, z: f64, p: f64| {
+                let d = m - 2.0 * z + p;
+                if d.abs() < 1e-12 {
+                    0.0
+                } else {
+                    (m - p) / (2.0 * d)
+                }
+            };
+            let fxs = if (1..6).contains(&bx) {
+                sub(c[by][bx - 1], c[by][bx], c[by][bx + 1])
+            } else {
+                0.0
+            };
+            let fys = if (1..6).contains(&by) {
+                sub(c[by - 1][bx], c[by][bx], c[by + 1][bx])
+            } else {
+                0.0
+            };
+            cells.push(format!(
+                "{name} ({:+.2},{:+.2}) [{:.2}]",
+                bx as f64 - M as f64 + fxs,
+                by as f64 - M as f64 + fys,
+                best
+            ));
+        }
+        println!("  {place:<4} {}", cells.join("  "));
+    }
+}
+
+/// 帯域解析。輝度・R−G・B−G を差分ガウスの 4 帯域(σ0.7 / 1.4 / 2.8 / 5.6 の差)に分け、
+/// reference の輝度(σ5.6 のぼかし)で 3 つの明るさに分けて、振幅・相関・最小二乗ゲインを出す。
+/// ゲインは「reference ≈ ゲイン × candidate」の係数で、1 でなければその帯域の強さが違う。
+/// 「ゲイン後」は帯域・明るさごとにゲインを掛けたあとの残差で、線形の調整で届く下限を表す。
+fn band_report(reference: &Image, cand: &Image) {
+    const SIGMAS: [f64; 4] = [0.7, 1.4, 2.8, 5.6];
+    const EDGES: [f32; 2] = [48.0, 128.0];
+    let (w, h) = (reference.width, reference.height);
+    #[derive(Default, Clone, Copy)]
+    struct S {
+        n: f64,
+        rr: f64,
+        cc: f64,
+        rc: f64,
+    }
+    let mut class: Vec<u8> = Vec::new();
+    println!("\n== 帯域別の比較(/255。帯域は差分ガウス、明るさは reference の輝度で 暗 <48 / 中 <128 / 明) ==");
+    for (which, name) in [(0usize, "輝度"), (1, "R−G"), (2, "B−G")] {
+        let blurs = |img: &Image| {
+            let p = component(img, which);
+            let mut v = vec![p.clone()];
+            for s in SIGMAS {
+                v.push(gauss_blur(&p, w, h, s));
+            }
+            v
+        };
+        let (rl, cl) = (blurs(reference), blurs(cand));
+        if which == 0 {
+            // 輝度のとき、σ5.6 のぼかしを reference の明るさとして保存する。
+            class = rl[4]
+                .iter()
+                .map(|&v| EDGES.iter().filter(|&&e| v >= e).count() as u8)
+                .collect();
+        }
+        // stats[明るさ][帯域 0..4 が高→低の 4 帯域、4 が低周波の残り]。
+        let mut stats = [[S::default(); 5]; 3];
+        for i in 0..w * h {
+            let k = class[i] as usize;
+            for b in 0..5 {
+                let (r, c) = if b < 4 {
+                    (rl[b][i] - rl[b + 1][i], cl[b][i] - cl[b + 1][i])
+                } else {
+                    (rl[4][i], cl[4][i])
+                };
+                let s = &mut stats[k][b];
+                s.n += 1.0;
+                s.rr += (r as f64).powi(2);
+                s.cc += (c as f64).powi(2);
+                s.rc += r as f64 * c as f64;
+            }
+        }
+        println!("\n[{name}]  帯域(σ)  明るさ    割合  ref の RMS  cand の RMS   相関   ゲイン");
+        let total: f64 = stats.iter().map(|s| s[0].n).sum();
+        let (mut actual, mut linear) = (0f64, 0f64);
+        for b in 0..5 {
+            let label = match b {
+                0 => "0〜0.7 ".to_string(),
+                4 => "5.6〜 ".to_string(),
+                _ => format!("{}〜{}", SIGMAS[b - 1], SIGMAS[b]),
+            };
+            for (k, kn) in ["暗", "中", "明"].iter().enumerate() {
+                let s = stats[k][b];
+                if s.n < 1.0 {
+                    continue;
+                }
+                actual += s.rr + s.cc - 2.0 * s.rc;
+                // 低周波(b == 4)にはゲインを掛けず、現状の差のまま足す。
+                linear += if b < 4 {
+                    (s.rr - s.rc * s.rc / s.cc.max(1e-12)).max(0.0)
+                } else {
+                    s.rr + s.cc - 2.0 * s.rc
+                };
+                if b < 4 {
+                    println!(
+                        "         {label:<8} {kn}   {:5.1}%  {:9.2}  {:11.2}   {:.3}  {:6.3}",
+                        100.0 * s.n / total,
+                        (s.rr / s.n).sqrt(),
+                        (s.cc / s.n).sqrt(),
+                        s.rc / (s.rr * s.cc).sqrt().max(1e-12),
+                        s.rc / s.cc.max(1e-12)
+                    );
+                }
+            }
+        }
+        println!(
+            "         RMSE(帯域の合計): 現状 {:.2} / 帯域・明るさごとのゲイン後 {:.2}(低周波 5.6〜 は現状のまま)",
+            (actual / total).sqrt(),
+            (linear / total).sqrt()
+        );
+    }
+}
+
 fn run(args: &[String]) -> Res<()> {
     let mut paths = Vec::new();
     let mut grid = 8usize;
+    let mut bands = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if a == "--grid" {
+        if a == "--bands" {
+            bands = true;
+        } else if a == "--grid" {
             grid = it
                 .next()
                 .and_then(|v| v.parse().ok())
@@ -575,7 +826,7 @@ fn run(args: &[String]) -> Res<()> {
         }
     }
     let [ref_path, cand_path] = paths[..] else {
-        return Err("usage: tiffcmp <reference.tif> <candidate.tif> [--grid N]".into());
+        return Err("usage: tiffcmp <reference.tif> <candidate.tif> [--grid N] [--bands]".into());
     };
     let read = |p: &String| fs::read(p).map_err(|e| format!("{p}: {e}"));
     let (ref_bytes, cand_bytes) = (read(ref_path)?, read(cand_path)?);
@@ -716,6 +967,10 @@ fn run(args: &[String]) -> Res<()> {
             .map(|s| format!("{:5.1}", s.rmse() / 257.0))
             .collect();
         println!("  {}", cells.join(" "));
+    }
+    if bands {
+        shift_report(&reference, &cand);
+        band_report(&reference, &cand);
     }
     Ok(())
 }
