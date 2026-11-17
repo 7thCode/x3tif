@@ -781,7 +781,12 @@ fn band_report(reference: &Image, cand: &Image) {
                     continue;
                 }
                 actual += s.rr + s.cc - 2.0 * s.rc;
-                linear += (s.rr - s.rc * s.rc / s.cc.max(1e-12)).max(0.0);
+                // 低周波(b == 4)にはゲインを掛けず、現状の差のまま足す。
+                linear += if b < 4 {
+                    (s.rr - s.rc * s.rc / s.cc.max(1e-12)).max(0.0)
+                } else {
+                    s.rr + s.cc - 2.0 * s.rc
+                };
                 if b < 4 {
                     println!(
                         "         {label:<8} {kn}   {:5.1}%  {:9.2}  {:11.2}   {:.3}  {:6.3}",
