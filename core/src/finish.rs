@@ -1,4 +1,6 @@
-//! Finishing of the developed Quattro picture: colour-noise smoothing and sharpening.
+//! Finishing of the developed picture (Quattro and DP Merrill): colour-noise smoothing and
+//! sharpening. The measurements below are of the sd Quattro; each camera's own values, and the
+//! measurements they come from, are on its `Params`.
 //!
 //! Both work on luminance `Y = (R + G + B) / 3` of the encoded 16 bit picture and the colour
 //! differences `R - Y`, `G - Y`, `B - Y`, and both are fitted to Photo Pro's TIFFs of the same
@@ -77,6 +79,28 @@ impl Params {
         amount: 1.2,
         fade: (0.1, 0.4),
         core: 2.0,
+    };
+
+    /// DP1 Merrill(CAMERAID 77。DP2 / DP3 Merrill=78 は参照が無いまま同じ値を使う)。Photo Pro 6.9.0 の
+    /// 既定設定(色・輝度のノイズ低減とも 2/4)の TIFF 5 枚(ISO 100)と、Adobe RGB で直接比べた
+    /// RMSE(/255、5 枚の平均、高周波は 16 画素ブロックの平均を引いた残り)で決めた。仕上げなしは
+    /// 8.39/7.40/8.03/12.05/8.88(平均 8.95、低周波 2.87、高周波 8.46)で、差の大半は高周波、
+    /// なかでも色ノイズだった。色差のぼかしだけで σ1/2/3/5 → 平均 5.91/5.70/5.72/5.83 と大きく
+    /// 下がる(σ2〜3 が底)。輝度の細部の除去(`core` 1/2/4 → 5.73/5.77/5.85)と中域の除去
+    /// (`mid_core` 2/4 → 6.28/6.87)は、除去なしの 5.70 より悪い。Photo Pro の輝度ノイズ低減は
+    /// これより弱い。逆に鮮鋭化は効く: 量 0.5/1.0/1.5/2.0 → 5.11/5.02/5.45/6.28(σ1)、負の量は
+    /// 6.67。σ0.8〜1.5 で量 0.8〜1.0 が底で、近傍(σ0.9〜1.2、量 0.8〜1.2、色差 σ2〜3、立ち上がり
+    /// 0.03〜0.1 から 0.2〜0.5)は 4.99〜5.13 の平らな領域。色差 σ2.5、鮮鋭化 σ1.0・量 0.8(暗部
+    /// 0.05〜0.3 で立ち上げ)にすると 4.12/4.59/4.81/6.85/4.58(平均 4.99、低周波 2.84、高周波
+    /// 4.08)で 5 枚とも下がる。高感度のファイルは測っていない。
+    pub const DP_MERRILL: Params = Params {
+        chroma_sigma: 2.5,
+        wide_sigma: 3.5,
+        mid_core: 0.0,
+        sharp_sigma: 1.0,
+        amount: 0.8,
+        fade: (0.05, 0.3),
+        core: 0.0,
     };
 
     /// 粒状感を強く消す値。sd Quattro の以前の既定値(Photo Pro 6.9.0 の TIFF との RMSE は

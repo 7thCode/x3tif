@@ -6,7 +6,7 @@ Sigma Foveon の X3F を 16bit TIFF に変換する Tauri デスクトップア�
 
 - `core/` — 外部依存なしの Rust ライブラリ `x3tif_core`。アプリの中身はほぼここ。
   - `x3f.rs`(コンテナ解析・デコード)、`camf.rs`(校正データ)、`develop.rs`(「見たまま」現像。最大のファイル)、
-    `finish.rs`(Quattro の色ノイズ抑制・鮮鋭化)、`preview.rs`(縮小プレビュー)、`tiff.rs` / `png.rs` / `icc.rs` / `exif.rs`(書き出し)、`convert.rs`(変換の入口)
+    `finish.rs`(Quattro と DP Merrill の色ノイズ抑制・鮮鋭化)、`preview.rs`(縮小プレビュー)、`tiff.rs` / `png.rs` / `icc.rs` / `exif.rs`(書き出し)、`convert.rs`(変換の入口)
   - `examples/x3tif.rs` — 検証用 CLI(下記)
 - `src-tauri/` — Tauri 本体(`src-tauri/src/lib.rs`: ドロップ → プレビュー → 調整 → 保存)
 - `src/index.html` — UI はこの 1 ファイルだけ(フレームワークなし)
