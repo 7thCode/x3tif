@@ -1,9 +1,9 @@
 //! X3F → 16 bit TIFF conversion, either as raw sensor values or developed to sRGB.
 
 use crate::camf::{Camf, Value};
-use crate::develop::{self, Developer, Exposure, Mode};
+use crate::develop::{self, ColorSpace, Developer, Exposure, Mode};
 use crate::exif::{self, PreviewExif};
-use crate::finish::Finisher;
+use crate::finish::{self, Finisher};
 use crate::tiff::{self, Compression, Exif, Metadata};
 use crate::x3f::{Error, Properties, Raw, X3f};
 use std::io::{self, Write};
@@ -84,8 +84,10 @@ pub fn x3f_to_tiff_with_progress<W: Write>(
 
     // Per-row finishing step: shift to the 16 bit range (raw) or develop.
     let mut ev = [0.0; 3];
+    let mut grain = 0.0;
     let developer = match mode {
         Mode::Developed(exposure, tuning) => {
+            grain = tuning.sanitized().grain;
             let mut d =
                 Developer::new(&raw, &camf, x3f.header_white_balance().as_deref(), &tuning)?;
             ev = match exposure {
@@ -98,6 +100,13 @@ pub fn x3f_to_tiff_with_progress<W: Write>(
         Mode::Raw => None,
     };
     let shift = develop::raw_shift(&camf);
+    // 位置を使う補正(Merrill のシェーディング)のために、行の位置も渡す。
+    let origin = area.x;
+    let finish_at = |row: &mut [u16], y: usize| {
+        if let Some(d) = &developer {
+            d.apply_at(row, y, |i| origin + i);
+        }
+    };
     let finish = |row: &mut [u16]| match &developer {
         Some(d) => d.apply(row),
         None => {
@@ -110,7 +119,7 @@ pub fn x3f_to_tiff_with_progress<W: Write>(
     };
 
     let output = match (&developer, shift) {
-        (Some(d), _) => Output::Developed(d.white_balance.clone(), ev),
+        (Some(d), _) => Output::Developed(d.white_balance.clone(), ev, d.color_space()),
         (None, s) => Output::Raw(1 << s),
     };
     let meta = metadata(&props, &camf, &preview, &output);
@@ -126,7 +135,11 @@ pub fn x3f_to_tiff_with_progress<W: Write>(
                 tick(y);
                 let at = ((y + area.y) * width + area.x) * 3;
                 row.copy_from_slice(&rgb[at..at + area.width * 3]);
-                finish(row);
+                if developer.is_some() {
+                    finish_at(row, y + area.y);
+                } else {
+                    finish(row);
+                }
             })?;
         }
         Raw::Quattro {
@@ -182,7 +195,8 @@ pub fn x3f_to_tiff_with_progress<W: Write>(
             };
             if developer.is_some() {
                 // The developed picture is finished; the raw one stays as the sensor read it.
-                let mut finisher = Finisher::new(area.width, area.height);
+                let mut finisher =
+                    Finisher::new(area.width, area.height, finish_params(&camf, grain));
                 tiff::write_rgb16(out, area.width, area.height, &meta, |y, row| {
                     tick(y);
                     finisher.row(y, &mut develop_row, row)
@@ -197,6 +211,18 @@ pub fn x3f_to_tiff_with_progress<W: Write>(
     }
     progress(1.0);
     Ok(())
+}
+
+/// 仕上げの強さは機種ごと: Photo Pro と比べて決めた dp0 Quattro(と、参照が無いまま同じ扱いにした
+/// dp1〜dp3 Quattro)は専用の値、それ以外の Quattro は sd Quattro に合わせた値。
+/// `grain`(0〜1)は利用者が選ぶ粒状感の抑制で、機種ごとの値から強い値へ寄せる。
+fn finish_params(camf: &Camf, grain: f64) -> finish::Params {
+    let base = if matches!(camf.number("CAMERAID"), Some(id) if (80.0..=83.0).contains(&id)) {
+        finish::Params::DP0_QUATTRO
+    } else {
+        finish::Params::SD_QUATTRO
+    };
+    base.blend(finish::Params::SMOOTH, grain)
 }
 
 /// Median colour (0..1, sRGB-encoded) of the camera's embedded JPEG preview, if the file has a
@@ -278,8 +304,8 @@ pub(crate) fn active_area(camf: &Camf, width: usize, height: usize) -> Area {
 enum Output {
     /// Raw sensor values multiplied by this factor.
     Raw(u32),
-    /// Developed with the named white balance.
-    Developed(String, [f64; 3]),
+    /// Developed with the named white balance and exposure, in this colour space.
+    Developed(String, [f64; 3], ColorSpace),
 }
 
 /// For each full-resolution coordinate, the two neighbouring low-resolution samples and the
@@ -397,8 +423,13 @@ fn metadata(props: &Properties, camf: &Camf, preview: &PreviewExif, output: &Out
         compression: Compression::Deflate,
         exif: exif(props, camf, preview),
         xmp: Some(xmp(props, camf, output)),
-        // Only the developed picture is sRGB; raw values are the sensor's own and stay untagged.
-        icc_profile: matches!(output, Output::Developed(..)).then(crate::icc::srgb),
+        // Only the developed picture has a colour space; raw values are the sensor's own and
+        // stay untagged.
+        icc_profile: match output {
+            Output::Developed(_, _, ColorSpace::Srgb) => Some(crate::icc::srgb()),
+            Output::Developed(_, _, ColorSpace::AdobeRgb) => Some(crate::icc::adobe_rgb()),
+            Output::Raw(_) => None,
+        },
     }
 }
 
@@ -432,8 +463,9 @@ fn xmp(props: &Properties, camf: &Camf, output: &Output) -> Vec<u8> {
     let how = match output {
         // Divide the samples by RawScale to get the sensor's own values back.
         Output::Raw(scale) => format!("x3f:OutputMode=\"raw\" x3f:RawScale=\"{scale}\""),
-        Output::Developed(wb, ev) => format!(
-            "x3f:OutputMode=\"developed\" x3f:ColorSpace=\"sRGB\" x3f:WhiteBalance=\"{}\" x3f:ExposureEV=\"{:.2},{:.2},{:.2}\"",
+        Output::Developed(wb, ev, space) => format!(
+            "x3f:OutputMode=\"developed\" x3f:ColorSpace=\"{}\" x3f:WhiteBalance=\"{}\" x3f:ExposureEV=\"{:.2},{:.2},{:.2}\"",
+            space.name(),
             xml_escape(wb),
             ev[0],
             ev[1],
@@ -566,6 +598,77 @@ mod tests {
         assert_eq!(t[1], (0, 1, 1));
         assert_eq!(t[2], (0, 1, 3));
         assert_eq!(t[5], (2, 2, 1)); // clamped at the right edge
+    }
+
+    #[test]
+    fn x3f_to_tiff_random_garbage_returns_error_without_panicking() {
+        // 正しい識別子の後ろがでたらめなファイル。末尾のディレクトリ位置もいろいろな値になる。
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..300 {
+            let len = 8 + (next() % 600) as usize;
+            let mut data: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            data[..4].copy_from_slice(b"FOVb");
+            // 半分は、ディレクトリがファイル内を指すようにして奥まで進ませる。
+            if round % 2 == 0 {
+                let at = (next() % len as u64) as u32;
+                data[len - 4..].copy_from_slice(&at.to_le_bytes());
+            }
+            for mode in [
+                Mode::Raw,
+                Mode::Developed(Exposure::Auto, Default::default()),
+            ] {
+                let mut out = Vec::new();
+                assert!(x3f_to_tiff(data.clone(), &mut out, mode).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn finish_params_are_chosen_by_camera() {
+        let camera = |id: f64| {
+            Camf(vec![crate::camf::Entry {
+                name: "CAMERAID".into(),
+                value: Value::Matrix {
+                    dims: vec![1],
+                    values: vec![id],
+                },
+            }])
+        };
+        for id in [80.0, 81.0, 82.0, 83.0] {
+            assert_eq!(
+                finish_params(&camera(id), 0.0),
+                finish::Params::DP0_QUATTRO,
+                "{id}"
+            );
+        }
+        for id in [41.0, 79.0, 84.0] {
+            assert_eq!(
+                finish_params(&camera(id), 0.0),
+                finish::Params::SD_QUATTRO,
+                "{id}"
+            );
+        }
+        assert_eq!(
+            finish_params(&camera(40.0), 0.0),
+            finish::Params::SD_QUATTRO
+        );
+        // 粒状感の抑制は機種ごとの値から強い値へ寄せる。
+        assert_eq!(finish_params(&camera(40.0), 1.0), finish::Params::SMOOTH);
+        assert_eq!(finish_params(&camera(83.0), 1.0), finish::Params::SMOOTH);
+        assert_eq!(
+            finish_params(&camera(83.0), 0.5),
+            finish::Params::DP0_QUATTRO.blend(finish::Params::SMOOTH, 0.5)
+        );
+        assert_eq!(
+            finish_params(&Camf::default(), 0.0),
+            finish::Params::SD_QUATTRO
+        );
     }
 
     #[test]

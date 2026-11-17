@@ -57,6 +57,23 @@ impl Camf {
             })
     }
 
+    /// 行列の次元と値。値の数が次元の積と合わないものは返さない。
+    pub fn matrix_with_dims(&self, name: &str) -> Option<(&[usize], &[f64])> {
+        self.0
+            .iter()
+            .find(|e| e.name == name)
+            .and_then(|e| match &e.value {
+                Value::Matrix { dims, values }
+                    if !values.is_empty()
+                        && dims.iter().try_fold(1usize, |n, &d| n.checked_mul(d))
+                            == Some(values.len()) =>
+                {
+                    Some((dims.as_slice(), values.as_slice()))
+                }
+                _ => None,
+            })
+    }
+
     /// Looks up `key` in the property list `list` (e.g. `WhiteBalanceGains` / `Sunlight`).
     pub fn property(&self, list: &str, key: &str) -> Option<&str> {
         self.0
@@ -99,7 +116,9 @@ pub(crate) fn decode(kind: u32, params: [u32; 4], body: &[u8]) -> Result<Camf> {
     let tree = HuffTree::from_pairs(pairs)?;
     let stream = body.get(STREAM_OFFSET..).ok_or(Error::Truncated)?;
     let size = decoded_size as usize;
-    if size > 1 << 28 {
+    // 1 つの値は最低 1 ビットを使い、最大 1.5 バイト(12bit 詰め)になる。それより大きい宣言サイズは
+    // 壊れているので、確保する前に弾く(数十バイトのファイルに 256 MiB を確保させない)。
+    if size > 1 << 28 || size > stream.len().saturating_mul(12) {
         return Err(Error::Corrupt("CAMF too large"));
     }
     let data = if kind == 5 {
@@ -123,7 +142,7 @@ fn unpack_bytes(stream: &[u8], tree: &HuffTree, bias: i32, size: usize) -> Resul
     let mut acc = bias;
     let mut out = Vec::with_capacity(size);
     for _ in 0..size {
-        acc += bits.diff(tree)?;
+        acc = acc.wrapping_add(bits.diff(tree)?);
         out.push(acc as u8);
     }
     Ok(out)
@@ -140,6 +159,9 @@ fn unpack_12bit(
 ) -> Result<Vec<u8>> {
     let mut bits = Bits::new(stream);
     let mut out = vec![0u8; size];
+    if size == 0 {
+        return Ok(out);
+    }
     let mut at = 0usize;
     let mut odd_dst = false;
     let mut row_start = [[bias; 2]; 2];
@@ -148,7 +170,7 @@ fn unpack_12bit(
         for col in 0..cols {
             let (oc, or) = (col & 1, row & 1);
             let prev = if col < 2 { row_start[or][oc] } else { acc[oc] };
-            let v = prev + bits.diff(tree)?;
+            let v = prev.wrapping_add(bits.diff(tree)?);
             acc[oc] = v;
             if col < 2 {
                 row_start[or][oc] = v;
@@ -300,6 +322,31 @@ mod tests {
     }
 
     #[test]
+    fn matrix_with_dims_returns_only_consistent_matrices() {
+        let m = |name: &str, dims: Vec<usize>, n: usize| Entry {
+            name: name.into(),
+            value: Value::Matrix {
+                dims,
+                values: vec![1.0; n],
+            },
+        };
+        let c = Camf(vec![
+            m("ok", vec![2, 3], 6),
+            m("short", vec![2, 3], 5),
+            m("huge", vec![usize::MAX, 2], 4),
+            Entry {
+                name: "text".into(),
+                value: Value::Text("x".into()),
+            },
+        ]);
+        let (dims, values) = c.matrix_with_dims("ok").unwrap();
+        assert_eq!((dims, values.len()), (&[2usize, 3][..], 6));
+        for name in ["short", "huge", "text", "missing"] {
+            assert!(c.matrix_with_dims(name).is_none(), "{name}");
+        }
+    }
+
+    #[test]
     fn parses_text_and_float_matrix_entries() {
         let mut text = 3u32.to_le_bytes().to_vec();
         text.extend_from_slice(b"hi\0");
@@ -332,6 +379,49 @@ mod tests {
         let camf = Camf(entries(&entry(CMB_M, "Big", &m)));
         assert_eq!(camf.matrix("Big"), None);
         assert_eq!(camf.0.len(), 1);
+    }
+
+    /// CAMF セクションの本体: 符号表(1 ビットの 0 = 差分なし)、サイズ欄、ビット列。
+    fn body(stream: &[u8]) -> Vec<u8> {
+        let mut b = vec![0u8; STREAM_OFFSET];
+        b[..2].copy_from_slice(&[1, 0]);
+        b.extend_from_slice(stream);
+        b
+    }
+
+    #[test]
+    fn decode_declared_size_larger_than_the_stream_returns_error() {
+        // 4 バイトのビット列から 256 MiB は出てこない。確保する前に弾く。
+        for kind in [4, 5] {
+            let r = decode(kind, [1 << 28, 0, 1 << 14, 1 << 14], &body(&[0; 4]));
+            assert!(matches!(r, Err(Error::Corrupt(_))), "kind {kind}");
+        }
+    }
+
+    #[test]
+    fn decode_truncated_stream_returns_error() {
+        // 20 バイトぶん(20 ビット)要るのに 16 ビットしかない。
+        let r = decode(5, [20, 0, 0, 0], &body(&[0; 2]));
+        assert!(matches!(r, Err(Error::Truncated)), "{:?}", r.err());
+        let ok = decode(5, [16, 0, 0, 0], &body(&[0; 2])).unwrap();
+        assert!(ok.0.is_empty()); // 中身はゼロなので、項目は無い
+    }
+
+    #[test]
+    fn decode_zero_size_returns_an_empty_block() {
+        for kind in [4, 5] {
+            let camf = decode(kind, [0, 0, 4, 4], &body(&[0; 8])).unwrap();
+            assert!(camf.0.is_empty(), "kind {kind}");
+        }
+    }
+
+    #[test]
+    fn decode_unknown_type_or_short_body_returns_error() {
+        assert!(matches!(
+            decode(2, [0; 4], &body(&[])),
+            Err(Error::Corrupt(_))
+        ));
+        assert!(matches!(decode(5, [0; 4], &[0; 10]), Err(Error::Truncated)));
     }
 
     #[test]

@@ -88,6 +88,11 @@ impl Loaded {
         max_side: usize,
     ) -> Result<Rendered, Error> {
         let max_side = max_side.clamp(MAX_SIDE_RANGE.0, MAX_SIDE_RANGE.1);
+        // プレビューは画面に出す 8bit の絵なので、保存時の色空間によらず sRGB で作る。
+        let tuning = &Tuning {
+            color_space: develop::ColorSpace::Srgb,
+            ..*tuning
+        };
         let mut developer =
             Developer::new(&self.raw, &self.camf, self.header_wb.as_deref(), tuning)?;
         let ev = match exposure {
@@ -125,7 +130,7 @@ impl Loaded {
                         src_y,
                     ));
                 }
-                developer.apply(&mut line);
+                developer.apply_at(&mut line, src_y, |i| x + pos(i, width, out_w));
                 for (i, px) in line.chunks_exact(3).enumerate() {
                     for c in 0..3 {
                         sum[(i / SUBSAMPLES) * 3 + c] += px[c] as u32;

@@ -378,14 +378,14 @@
           <div class="card">
             <h4>見たままの仕上がり</h4>
             <p>
-              ホワイトバランス、色変換、露出、トーンカーブを適用した 16bit の sRGB TIFF(ICC プロファイル付き)。
-              sd Quattro は Photo Pro に近い明るさとトーンに合わせています。
+              ホワイトバランス、色変換、露出、トーンカーブを適用した 16bit の TIFF(sRGB か Adobe RGB を選択、ICC プロファイル付き)。
+              sd Quattro・dp0〜dp3 Quattro・DP Merrill は Photo Pro に近い明るさとトーンに合わせています(画素単位では一致しません)。
             </p>
           </div>
           <div class="card">
             <h4>粒状感の抑制と鮮鋭化</h4>
             <p>
-              Quattro は輝度を鮮鋭化し、色ノイズと中域の粒状感を抑えます。WB ゲインなどの校正値は XMP に、機種名・撮影日時・絞り・
+              Quattro は輝度を鮮鋭化し、色ノイズと粒状感を抑えます(強さは機種ごとに Photo Pro に合わせ、粒状感は調整で強くできます)。DP Merrill は周辺の光量落ちと色かぶりを補正します。WB ゲインなどの校正値は XMP に、機種名・撮影日時・絞り・
               露出時間・ISO などは EXIF に保存します。
             </p>
           </div>
@@ -428,9 +428,9 @@
         </div>
         <dl class="spec">
           <dt>画像</dt>
-          <dd>16bit ・ 3 チャンネル ・ TIFF(Deflate 圧縮、ロスレス)。見たまま: sRGB ・ 生データ: リニア RGB</dd>
+          <dd>16bit ・ 3 チャンネル ・ TIFF(Deflate 圧縮、ロスレス)。見たまま: sRGB または Adobe RGB ・ 生データ: リニア RGB</dd>
           <dt>処理</dt>
-          <dd>見たまま: 黒レベル・WB・色変換・露出・トーン・sRGB ガンマを適用(Quattro は鮮鋭化と粒状感の抑制も)。生データ: 適用なし</dd>
+          <dd>見たまま: 黒レベル・WB・色変換・露出・トーン・ガンマを適用(Quattro は鮮鋭化と粒状感の抑制、DP Merrill はシェーディング補正も)。生データ: 適用なし</dd>
           <dt>メタデータ</dt>
           <dd>機種名 / 撮影日時 / 向き / EXIF(絞り・露出時間・ISO・露出補正・焦点距離) / XMP(PROP と CAMF の校正値)</dd>
           <dt>対象外</dt>

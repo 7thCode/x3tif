@@ -1,7 +1,8 @@
-//! A minimal sRGB ICC profile (v2.1, matrix/TRC), built in code so no profile data has to ship.
+//! Minimal ICC profiles (v2.1, matrix/TRC), built in code so no profile data has to ship.
 //!
-//! Colorants are the sRGB primaries adapted to the D50 profile connection space (Bradford), the
-//! tone curve is the sRGB transfer function sampled at 1024 points.
+//! sRGB: colorants are the sRGB primaries adapted to the D50 profile connection space (Bradford),
+//! the tone curve is the sRGB transfer function sampled at 1024 points.
+//! Adobe RGB (1998) 互換: 同じく D50 に順応させた原色と、ガンマ 563/256 の曲線。
 
 const D50: [f64; 3] = [0.9642, 1.0, 0.8249];
 const RED: [f64; 3] = [0.43607, 0.22249, 0.01392];
@@ -9,6 +10,12 @@ const GREEN: [f64; 3] = [0.38515, 0.71687, 0.09708];
 const BLUE: [f64; 3] = [0.14307, 0.06061, 0.71410];
 const CURVE_POINTS: usize = 1024;
 const DESCRIPTION: &str = "sRGB IEC61966-2.1 (x3tif)";
+const ADOBE_RED: [f64; 3] = [0.60974, 0.31111, 0.01947];
+const ADOBE_GREEN: [f64; 3] = [0.20528, 0.62567, 0.06087];
+const ADOBE_BLUE: [f64; 3] = [0.14919, 0.06322, 0.74457];
+/// u8Fixed8 のガンマ 2.19921875。
+const ADOBE_GAMMA: u16 = 563;
+const ADOBE_DESCRIPTION: &str = "Adobe RGB (1998) compatible (x3tif)";
 const COPYRIGHT: &str = "Public domain";
 
 fn s15f16(v: f64) -> [u8; 4] {
@@ -56,17 +63,37 @@ fn curve_tag() -> Vec<u8> {
     b
 }
 
-/// The profile as bytes, ready for the TIFF ICCProfile tag.
+/// 点が 1 つの `curv` はガンマ値(u8Fixed8)。
+fn gamma_tag(gamma: u16) -> Vec<u8> {
+    let mut b = b"curv\0\0\0\0".to_vec();
+    b.extend_from_slice(&1u32.to_be_bytes());
+    b.extend_from_slice(&gamma.to_be_bytes());
+    b
+}
+
+/// The sRGB profile as bytes, ready for the TIFF ICCProfile tag.
 pub fn srgb() -> Vec<u8> {
+    profile(DESCRIPTION, [RED, GREEN, BLUE], curve_tag())
+}
+
+/// Adobe RGB (1998) 互換のプロファイル。
+pub fn adobe_rgb() -> Vec<u8> {
+    profile(
+        ADOBE_DESCRIPTION,
+        [ADOBE_RED, ADOBE_GREEN, ADOBE_BLUE],
+        gamma_tag(ADOBE_GAMMA),
+    )
+}
+
+fn profile(description: &str, colorants: [[f64; 3]; 3], curve: Vec<u8>) -> Vec<u8> {
     // The three tone curves are identical, so one stored copy serves all of them.
-    let curve = curve_tag();
     let tags: [(&[u8; 4], Vec<u8>); 9] = [
         (b"cprt", text_tag(COPYRIGHT)),
-        (b"desc", desc_tag(DESCRIPTION)),
+        (b"desc", desc_tag(description)),
         (b"wtpt", xyz_tag(D50)),
-        (b"rXYZ", xyz_tag(RED)),
-        (b"gXYZ", xyz_tag(GREEN)),
-        (b"bXYZ", xyz_tag(BLUE)),
+        (b"rXYZ", xyz_tag(colorants[0])),
+        (b"gXYZ", xyz_tag(colorants[1])),
+        (b"bXYZ", xyz_tag(colorants[2])),
         (b"rTRC", curve.clone()),
         (b"gTRC", Vec::new()),
         (b"bTRC", Vec::new()),
@@ -179,6 +206,40 @@ mod tests {
         // sRGB 0.5 encodes linear 0.2140; index 511.5 sits between two samples.
         let mid = (at(511) as f64 + at(512) as f64) / 2.0 / 65535.0;
         assert!((mid - 0.2140).abs() < 0.001, "{mid}");
+    }
+
+    #[test]
+    fn adobe_rgb_profile_is_well_formed_and_has_a_gamma_curve() {
+        let p = adobe_rgb();
+        assert_eq!(u32_at(&p, 0), p.len());
+        assert_eq!(p.len() % 4, 0);
+        assert_eq!(&p[36..40], b"acsp");
+        let n = u32_at(&p, 128);
+        assert_eq!(n, 9);
+        for i in 0..n {
+            let e = 132 + i * 12;
+            let (off, len) = (u32_at(&p, e + 4), u32_at(&p, e + 8));
+            assert!(off >= 132 + n * 12 && off + len <= p.len(), "tag {i}");
+        }
+        let e = (0..n)
+            .map(|i| 132 + i * 12)
+            .find(|&e| &p[e..e + 4] == b"bTRC")
+            .unwrap();
+        let off = u32_at(&p, e + 4);
+        assert_eq!(u32_at(&p, e + 8), 14);
+        assert_eq!(&p[off..off + 4], b"curv");
+        assert_eq!(u32_at(&p, off + 8), 1);
+        assert_eq!(u16::from_be_bytes([p[off + 12], p[off + 13]]), 563);
+        assert!(p.windows(16).any(|w| w == b"Adobe RGB (1998)"));
+        assert_ne!(p, srgb());
+    }
+
+    #[test]
+    fn adobe_rgb_colorants_sum_to_the_d50_white_point() {
+        for c in 0..3 {
+            let sum = ADOBE_RED[c] + ADOBE_GREEN[c] + ADOBE_BLUE[c];
+            assert!((sum - D50[c]).abs() < 0.0005, "channel {c}: {sum}");
+        }
     }
 
     #[test]

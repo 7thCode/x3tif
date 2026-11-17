@@ -89,12 +89,19 @@
         <label for="wb">WB</label>
         <select id="wb"></select>
       </div>
+      <div class="row wb" title="保存する TIFF の色空間(ICC プロファイルを埋め込みます)。プレビューは常に sRGB で表示します">
+        <label for="cs">色空間</label>
+        <select id="cs">
+          <option value="sRGB">sRGB</option>
+          <option value="AdobeRGB">Adobe RGB</option>
+        </select>
+      </div>
       <div class="row">
         <label for="ev">露出</label>
         <input type="range" id="ev" min="-4" max="4" step="0.1" value="0" disabled>
         <output id="ev-out">+0.0</output>
       </div>
-      <label id="auto-row" title="カメラが記録したプレビュー JPEG の明るさに合わせます(sd Quattro は +1.0 EV 固定)"><input type="checkbox" id="auto" checked> 自動</label>
+      <label id="auto-row" title="カメラが記録したプレビュー JPEG の明るさに合わせます(Photo Pro に合わせた機種は固定: sd Quattro +1.0 EV、dp0〜dp3 Quattro・DP Merrill 0 EV)"><input type="checkbox" id="auto" checked> 自動</label>
       <div class="row">
         <label for="red">赤</label>
         <input type="range" id="red" min="0.5" max="2" step="0.01" value="1">
@@ -109,6 +116,11 @@
         <label for="tone">トーン</label>
         <input type="range" id="tone" min="0" max="1" step="0.01" value="0.5">
         <output id="tone-out">0.50</output>
+      </div>
+      <div class="row" title="Quattro の粒状感と色ノイズの抑制。0 は Photo Pro に合わせた値、1 は強く消します。保存する TIFF にだけ効き、プレビューには反映されません">
+        <label for="grain">粒状感</label>
+        <input type="range" id="grain" min="0" max="1" step="0.01" value="0">
+        <output id="grain-out">0.00</output>
       </div>
     </fieldset>
     <div id="note"></div>
@@ -136,8 +148,8 @@
   for (const [v, label] of WB) $('wb').add(new Option(label, v));
 
   // The calibrated values: what "標準に戻す" returns to, and what a missing settings file means.
-  const STANDARD = { white_balance: null, red: 1, blue: 1, tone: 0.5 };
-  const sliders = ['red', 'blue', 'tone'];
+  const STANDARD = { color_space: 'sRGB', white_balance: null, red: 1, blue: 1, tone: 0.5, grain: 0 };
+  const sliders = ['red', 'blue', 'tone', 'grain'];
 
   const files = [];          // { path, name, state, cls }
   let selected = -1;
@@ -151,15 +163,19 @@
 
   function settings() {
     return {
+      color_space: $('cs').value,
       white_balance: $('wb').value || null,
       red: Number($('red').value),
       blue: Number($('blue').value),
       tone: Number($('tone').value),
+      grain: Number($('grain').value),
     };
   }
   function apply(s) {
     $('wb').value = s.white_balance || '';
     if ($('wb').value !== (s.white_balance || '')) $('wb').value = '';
+    $('cs').value = s.color_space || 'sRGB';
+    if (!$('cs').value) $('cs').value = 'sRGB';
     for (const k of sliders) { $(k).value = s[k]; $(k + '-out').textContent = fmt(s[k]); }
   }
   const exposure = () => ($('auto').checked ? null : Number($('ev').value));
@@ -279,7 +295,8 @@
   $('reset').onclick = () => { apply(STANDARD); schedule(); say(''); };
 
   // ---- controls ----
-  for (const k of sliders) $(k).oninput = () => { $(k + '-out').textContent = fmt($(k).value); schedule(); };
+  // 粒状感は保存する TIFF にだけ効くので、プレビューは作り直さない。
+  for (const k of sliders) $(k).oninput = () => { $(k + '-out').textContent = fmt($(k).value); if (k !== 'grain') schedule(); };
   $('wb').onchange = schedule;
   $('ev').oninput = () => { $('ev-out').textContent = fmt($('ev').value, true); schedule(); };
   $('auto').onchange = () => { $('ev').disabled = $('auto').checked; schedule(); };

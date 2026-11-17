@@ -13,6 +13,14 @@ const CAMF_HEADER_SIZE: usize = 28;
 const PROPERTY_HEADER_SIZE: usize = 24;
 const TRUE_PLANES: usize = 3;
 
+/// 入力ファイルの大きさの上限(1 GiB)。実ファイルは最大でも 150 MB ほど。読み込む前に確かめる用。
+pub const MAX_FILE_BYTES: u64 = 1 << 30;
+/// PROP セクション 1 つあたりの件数と、1 つの文字列の長さ(UTF-16 単位)の上限。
+const MAX_PROPERTIES: usize = 4096;
+const MAX_PROPERTY_CHARS: usize = 4096;
+/// 1 つの差分値に使えるビット数の上限。14bit のセンサー値には 15 あれば足りる。
+const MAX_DIFF_BITS: u8 = 24;
+
 const TYPE_PREVIEW: u32 = 2;
 const FORMAT_MERRILL: u32 = 0x0001_001e;
 const FORMAT_QUATTRO: u32 = 0x0001_0023;
@@ -206,19 +214,30 @@ impl X3f {
             }
             let mut r = Reader::at(&self.data, e.offset + 8);
             let num = r.u32()? as usize;
+            // 実ファイルは数十件。件数と文字列長に上限を置き、壊れたファイルで時間やメモリを
+            // 使い切らないようにする。
+            if num > MAX_PROPERTIES {
+                return Err(Error::Corrupt("too many properties"));
+            }
             let mut r = Reader::at(&self.data, e.offset + PROPERTY_HEADER_SIZE);
-            let mut table = Vec::with_capacity(num.min(4096));
+            let mut table = Vec::with_capacity(num);
             for _ in 0..num {
                 table.push((r.u32()? as usize, r.u32()? as usize));
             }
-            let strings = r.take(e.offset + e.size - r.pos)?;
+            // 表がセクションの宣言サイズをはみ出していたら壊れている。
+            let rest = (e.offset + e.size)
+                .checked_sub(r.pos)
+                .ok_or(Error::Truncated)?;
+            let strings = r.take(rest)?;
             let utf16 = |off: usize| -> String {
-                let units: Vec<u16> = strings
-                    .get(off * 2..)
+                let units: Vec<u16> = off
+                    .checked_mul(2)
+                    .and_then(|at| strings.get(at..))
                     .unwrap_or(&[])
                     .chunks_exact(2)
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .take_while(|&u| u != 0)
+                    .take(MAX_PROPERTY_CHARS)
                     .collect();
                 String::from_utf16_lossy(&units)
             };
@@ -449,7 +468,8 @@ impl HuffTree {
     }
 }
 
-/// MSB-first bit reader; reads past the end yield zero bits.
+/// MSB 先頭のビットリーダ。終端を越えて読むとエラーにする(途中で切れたストリームを、
+/// 黙ってゼロのビットで埋めて画素をでっち上げないため)。
 pub(crate) struct Bits<'a> {
     data: &'a [u8],
     pos: usize,
@@ -460,18 +480,18 @@ impl<'a> Bits<'a> {
         Bits { data, pos: 0 }
     }
 
-    fn bit(&mut self) -> u8 {
-        let byte = self.data.get(self.pos >> 3).copied().unwrap_or(0);
+    fn bit(&mut self) -> Result<u8> {
+        let byte = *self.data.get(self.pos >> 3).ok_or(Error::Truncated)?;
         let b = (byte >> (7 - (self.pos & 7))) & 1;
         self.pos += 1;
-        b
+        Ok(b)
     }
 
     /// One TRUE difference value: Huffman-coded bit count, then that many raw bits.
     pub(crate) fn diff(&mut self, tree: &HuffTree) -> Result<i32> {
         let mut n = 0usize;
         while tree.nodes[n] != [NONE, NONE] {
-            n = tree.nodes[n][self.bit() as usize] as usize;
+            n = tree.nodes[n][self.bit()? as usize] as usize;
             if n == NONE as usize {
                 return Err(Error::Corrupt("unexpected huffman bit"));
             }
@@ -480,10 +500,14 @@ impl<'a> Bits<'a> {
         if nbits == 0 || nbits == NONE as u8 {
             return Ok(0);
         }
-        let first = self.bit() as i32;
+        // 葉の値は表の添字なので、壊れた表では 255 まであり得る。シフトがあふれる前に弾く。
+        if nbits > MAX_DIFF_BITS {
+            return Err(Error::Corrupt("huffman difference too wide"));
+        }
+        let first = self.bit()? as i32;
         let mut d = first;
         for _ in 1..nbits {
-            d = (d << 1) + self.bit() as i32;
+            d = (d << 1) + self.bit()? as i32;
         }
         if first == 0 {
             d -= (1 << nbits) - 1;
@@ -519,7 +543,8 @@ fn decode_plane(
             } else {
                 acc[odd_col]
             };
-            let value = prev + diff;
+            // 壊れたストリームでは差分の累積が i32 をあふれ得る。値は下位 16 ビットしか使わない。
+            let value = prev.wrapping_add(diff);
             acc[odd_col] = value;
             if col < 2 {
                 row_start[odd_row][odd_col] = value;
@@ -601,6 +626,137 @@ mod tests {
         let q = body(true, [(0, 0), (0, 0), (60_000, 60_000)]);
         let f = x3f_with_image((1, 0x23), 100, 0, &q, 128);
         assert!(matches!(decode(f), Err(Error::Corrupt(_))));
+    }
+
+    /// 4x4 の Merrill 画像。符号は「1 ビットの 0 = 差分なし」だけなので、1 プレーンに 16 ビット要る。
+    fn merrill_4x4(plane_bytes: u32) -> Vec<u8> {
+        // `x3f_with_image` が書くヘッダは 24 バイト。28 バイトのヘッダの残り(行サイズ)を先に足す。
+        let mut b = vec![0u8; 4];
+        b.extend([0u8; 8]); // シード 3 つと不明な u16
+        b.extend([1, 0, 0, 0]); // 符号表: (長さ 1, 符号 0)、終端
+        b.extend(u32s(&[plane_bytes; 3]));
+        b.extend([0u8; 48]); // プレーンは 16 バイト境界に並ぶ
+        let size = (IMAGE_HEADER_SIZE - 4 + b.len()) as u32;
+        x3f_with_image((1, 0x1e), 4, 4, &b, size)
+    }
+
+    #[test]
+    fn decode_complete_planes_returns_the_image() {
+        let Ok(Raw::Merrill { width, height, rgb }) = decode(merrill_4x4(2)) else {
+            panic!("decodes");
+        };
+        assert_eq!((width, height, rgb.len()), (4, 4, 48));
+        assert!(rgb.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn decode_truncated_plane_returns_error() {
+        // 16 ビット要るところに 8 ビットしかない。ゼロで埋めて続けたりしない。
+        assert!(matches!(decode(merrill_4x4(1)), Err(Error::Truncated)));
+    }
+
+    #[test]
+    fn diff_wider_than_the_limit_returns_error() {
+        // 葉の値(= 表の添字)が 25 になる符号。差分 25 ビットは上限を超える。
+        let tree = HuffTree::from_pairs((0..26u8).map(|i| (8, i))).unwrap();
+        let wide = Bits::new(&[25, 0, 0, 0, 0]).diff(&tree);
+        assert!(matches!(wide, Err(Error::Corrupt(_))), "{wide:?}");
+        // 上限以内なら読める(24 ビットの 1 → 2^24 - 1)。
+        let ok = Bits::new(&[24, 0xff, 0xff, 0xff]).diff(&tree);
+        assert_eq!(ok.ok(), Some((1 << 24) - 1));
+    }
+
+    #[test]
+    fn decode_overflowing_differences_does_not_panic() {
+        // 毎画素 +(2^24 - 1) を足し続けると i32 をあふれる幅の画像。
+        let tree = HuffTree::from_pairs((0..26u8).map(|i| (8, i))).unwrap();
+        let data: Vec<u8> = (0..400).flat_map(|_| [24u8, 0xff, 0xff, 0xff]).collect();
+        let mut n = 0;
+        decode_plane(&data, &tree, i32::MAX - 5, 400, 1, 400, |_, _| n += 1).unwrap();
+        assert_eq!(n, 400);
+    }
+
+    /// PROP セクション 1 つだけの X3F。`declared_size` はディレクトリが言うセクションの大きさ。
+    fn x3f_with_properties(num: u32, table_and_strings: &[u8], declared_size: u32) -> Vec<u8> {
+        let mut f = vec![0u8; 128];
+        f[..4].copy_from_slice(b"FOVb");
+        let off = f.len() as u32;
+        f.extend_from_slice(b"SECp");
+        f.extend(u32s(&[0, num, 0, 0, 0]));
+        f.extend_from_slice(table_and_strings);
+        let dir = f.len() as u32;
+        f.extend_from_slice(b"SECd");
+        f.extend(u32s(&[0, 1, off, declared_size, 0, dir]));
+        f
+    }
+
+    fn utf16(s: &str) -> Vec<u8> {
+        s.encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+
+    #[test]
+    fn properties_well_formed_section_returns_the_pairs() {
+        let mut body = u32s(&[0, 4]); // 名前は 0 文字目、値は 4 文字目から
+        body.extend(utf16("ISO"));
+        body.extend(utf16("100"));
+        let size = PROPERTY_HEADER_SIZE as u32 + body.len() as u32;
+        let x = X3f::parse(x3f_with_properties(1, &body, size)).unwrap();
+        assert_eq!(x.properties().unwrap().get("ISO"), Some("100"));
+    }
+
+    #[test]
+    fn properties_table_beyond_the_section_returns_error() {
+        // 表(2 件 = 16 バイト)が、宣言されたセクション(ヘッダ + 8 バイト)をはみ出す。
+        let body = u32s(&[0, 0, 0, 0]);
+        let f = x3f_with_properties(2, &body, PROPERTY_HEADER_SIZE as u32 + 8);
+        let r = X3f::parse(f).unwrap().properties();
+        assert!(matches!(r, Err(Error::Truncated)));
+    }
+
+    #[test]
+    fn properties_absurd_count_returns_error() {
+        let f = x3f_with_properties(u32::MAX, &[], PROPERTY_HEADER_SIZE as u32);
+        let r = X3f::parse(f).unwrap().properties();
+        assert!(matches!(r, Err(Error::Corrupt(_))));
+    }
+
+    #[test]
+    fn properties_string_without_terminator_is_cut_at_the_limit() {
+        let mut body = u32s(&[0, 0]);
+        body.extend(std::iter::repeat_n([b'a', 0], MAX_PROPERTY_CHARS + 50).flatten());
+        let size = PROPERTY_HEADER_SIZE as u32 + body.len() as u32;
+        let x = X3f::parse(x3f_with_properties(1, &body, size)).unwrap();
+        assert_eq!(x.properties().unwrap().0[0].0.len(), MAX_PROPERTY_CHARS);
+    }
+
+    #[test]
+    fn parse_truncated_or_empty_file_returns_error() {
+        assert!(matches!(X3f::parse(Vec::new()), Err(Error::Truncated)));
+        assert!(matches!(X3f::parse(b"FOV".to_vec()), Err(Error::Truncated)));
+        // ディレクトリの位置がファイルの外。
+        let mut f = b"FOVb".to_vec();
+        f.extend([0u8; 60]);
+        f.extend(u32::MAX.to_le_bytes());
+        assert!(matches!(X3f::parse(f), Err(Error::Truncated)));
+        // どの長さで切っても、パニックせずエラーか成功を返す。
+        let whole = merrill_4x4(2);
+        for n in 0..whole.len() {
+            let _ = X3f::parse(whole[..n].to_vec()).and_then(|x| {
+                x.properties()?;
+                x.camf()?;
+                x.decode()
+            });
+        }
+    }
+
+    #[test]
+    fn decode_unsupported_camera_returns_error() {
+        // SD14 など旧世代の RAW(type 3, format 6)は対象外。
+        let f = x3f_with_image((3, 6), 100, 100, &[0; 64], 128);
+        assert!(matches!(decode(f), Err(Error::Unsupported(0x0003_0006))));
     }
 
     #[test]
