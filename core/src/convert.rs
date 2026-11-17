@@ -131,8 +131,7 @@ pub fn x3f_to_tiff_with_progress<W: Write>(
     };
     match raw {
         Raw::Merrill { width, rgb, .. } => {
-            tiff::write_rgb16(out, area.width, area.height, &meta, |y, row| {
-                tick(y);
+            let mut develop_row = |y: usize, row: &mut [u16]| {
                 let at = ((y + area.y) * width + area.x) * 3;
                 row.copy_from_slice(&rgb[at..at + area.width * 3]);
                 if developer.is_some() {
@@ -140,7 +139,21 @@ pub fn x3f_to_tiff_with_progress<W: Write>(
                 } else {
                     finish(row);
                 }
-            })?;
+            };
+            if developer.is_some() {
+                // 現像した絵だけ仕上げる(ノイズ抑制)。生データはセンサーの値のまま。
+                let mut finisher =
+                    Finisher::new(area.width, area.height, finish_params(&camf, grain));
+                tiff::write_rgb16(out, area.width, area.height, &meta, |y, row| {
+                    tick(y);
+                    finisher.row(y, &mut develop_row, row)
+                })?;
+            } else {
+                tiff::write_rgb16(out, area.width, area.height, &meta, |y, row| {
+                    tick(y);
+                    develop_row(y, row)
+                })?;
+            }
         }
         Raw::Quattro {
             low_width,
@@ -214,10 +227,13 @@ pub fn x3f_to_tiff_with_progress<W: Write>(
 }
 
 /// 仕上げの強さは機種ごと: Photo Pro と比べて決めた dp0 Quattro(と、参照が無いまま同じ扱いにした
-/// dp1〜dp3 Quattro)は専用の値、それ以外の Quattro は sd Quattro に合わせた値。
+/// dp1〜dp3 Quattro)と DP1 Merrill(同じく DP2 / DP3 Merrill)は専用の値、それ以外の Quattro は
+/// sd Quattro に合わせた値。
 /// `grain`(0〜1)は利用者が選ぶ粒状感の抑制で、機種ごとの値から強い値へ寄せる。
 fn finish_params(camf: &Camf, grain: f64) -> finish::Params {
-    let base = if matches!(camf.number("CAMERAID"), Some(id) if (80.0..=83.0).contains(&id)) {
+    let base = if matches!(camf.number("CAMERAID"), Some(id) if (77.0..=78.0).contains(&id)) {
+        finish::Params::DP_MERRILL
+    } else if matches!(camf.number("CAMERAID"), Some(id) if (80.0..=83.0).contains(&id)) {
         finish::Params::DP0_QUATTRO
     } else {
         finish::Params::SD_QUATTRO
@@ -658,6 +674,15 @@ mod tests {
             finish_params(&camera(40.0), 0.0),
             finish::Params::SD_QUATTRO
         );
+        // DP Merrill(77 と、参照が無いまま同じ扱いの 78)にも仕上げがある。
+        for id in [77.0, 78.0] {
+            assert_eq!(
+                finish_params(&camera(id), 0.0),
+                finish::Params::DP_MERRILL,
+                "{id}"
+            );
+            assert_eq!(finish_params(&camera(id), 1.0), finish::Params::SMOOTH);
+        }
         // 粒状感の抑制は機種ごとの値から強い値へ寄せる。
         assert_eq!(finish_params(&camera(40.0), 1.0), finish::Params::SMOOTH);
         assert_eq!(finish_params(&camera(83.0), 1.0), finish::Params::SMOOTH);
