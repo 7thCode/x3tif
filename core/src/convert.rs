@@ -569,6 +569,35 @@ mod tests {
     }
 
     #[test]
+    fn x3f_to_tiff_random_garbage_returns_error_without_panicking() {
+        // 正しい識別子の後ろがでたらめなファイル。末尾のディレクトリ位置もいろいろな値になる。
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..300 {
+            let len = 8 + (next() % 600) as usize;
+            let mut data: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            data[..4].copy_from_slice(b"FOVb");
+            // 半分は、ディレクトリがファイル内を指すようにして奥まで進ませる。
+            if round % 2 == 0 {
+                let at = (next() % len as u64) as u32;
+                data[len - 4..].copy_from_slice(&at.to_le_bytes());
+            }
+            for mode in [
+                Mode::Raw,
+                Mode::Developed(Exposure::Auto, Default::default()),
+            ] {
+                let mut out = Vec::new();
+                assert!(x3f_to_tiff(data.clone(), &mut out, mode).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn rejects_non_x3f_input() {
         let mut out = Vec::new();
         let err = x3f_to_tiff(vec![0; 64], &mut out, Mode::Raw).unwrap_err();

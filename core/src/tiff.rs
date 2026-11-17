@@ -305,12 +305,17 @@ pub fn write_rgb16<W: Write>(
     if pixel_start + counts.iter().sum::<usize>() > u32::MAX as usize {
         return Err(too_large());
     }
-    if let Value::Extra(b) = &mut tags[strip_offsets_at].value {
-        let mut off = pixel_start;
-        for (s, &c) in counts.iter().enumerate() {
-            b[s * 4..s * 4 + 4].copy_from_slice(&(off as u32).to_le_bytes());
-            off += c;
+    match &mut tags[strip_offsets_at].value {
+        Value::Extra(b) => {
+            let mut off = pixel_start;
+            for (s, &c) in counts.iter().enumerate() {
+                b[s * 4..s * 4 + 4].copy_from_slice(&(off as u32).to_le_bytes());
+                off += c;
+            }
         }
+        // ストリップが 1 本だけだとオフセットは 4 バイトなので、`extra` がタグの値欄に直接置く。
+        // その値そのものを書き換えないと、タグ 273 が 0 のまま残り、画素ではなく TIFF ヘッダを指す。
+        Value::Inline(v) => *v = pixel_start as u32,
     }
 
     out.write_all(b"II*\0")?;
@@ -376,6 +381,42 @@ mod tests {
         let at = strip1 + ((20 - ROWS_PER_STRIP) * w + 2) * 6 + 2;
         assert_eq!(u16_at(&out, at) as usize, 20 * 1000 + 2 * 3 + 1);
         assert_eq!(strips, 3);
+    }
+
+    #[test]
+    fn single_strip_offset_points_at_the_pixels() {
+        // 16 行以下はストリップが 1 本で、オフセットはタグの値欄に直接入る。
+        for compression in [Compression::None, Compression::Deflate] {
+            let (w, h) = (3, ROWS_PER_STRIP);
+            let mut out = Vec::new();
+            let meta = Metadata {
+                compression,
+                ..Default::default()
+            };
+            write_rgb16(&mut out, w, h, &meta, |y, row| {
+                for (i, v) in row.iter_mut().enumerate() {
+                    *v = (y * 100 + i) as u16;
+                }
+            })
+            .unwrap();
+            let ifd = u32_at(&out, 4) as usize;
+            let n = u16_at(&out, ifd) as usize;
+            let entry = |tag: u16| {
+                (0..n)
+                    .map(|i| ifd + 2 + i * 12)
+                    .find(|&e| u16_at(&out, e) == tag)
+                    .unwrap()
+            };
+            assert_eq!(u32_at(&out, entry(273) + 4), 1, "one strip");
+            let offset = u32_at(&out, entry(273) + 8) as usize;
+            let count = u32_at(&out, entry(279) + 8) as usize;
+            assert!(offset > ifd, "{compression:?}: offset {offset}");
+            assert_eq!(offset + count, out.len(), "{compression:?}");
+            if compression == Compression::None {
+                // 2 行目の先頭サンプル。
+                assert_eq!(u16_at(&out, offset + w * 6), 100);
+            }
+        }
     }
 
     #[test]

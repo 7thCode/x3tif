@@ -133,6 +133,10 @@ pub fn repair_highlight_pixels(raw: &mut Raw, camf: &Camf) {
             if y + 1 < h {
                 neighbours.push((x, y + 1));
             }
+            // 1x1 の層には隣が無い(壊れたファイル)。ゼロ除算しない。
+            if neighbours.is_empty() {
+                continue;
+            }
             for c in 0..3 {
                 let sum: u32 = neighbours
                     .iter()

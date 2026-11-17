@@ -3,6 +3,14 @@
 use std::{env, fs, io::BufWriter, process::ExitCode};
 use x3tif_core::develop::{Exposure, Mode, Tuning};
 
+/// 入力を読む。X3F としてあり得ない大きさのファイルは、メモリに載せる前に断る。
+fn read_input(path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if fs::metadata(path)?.len() > x3tif_core::x3f::MAX_FILE_BYTES {
+        return Err("ファイルが大きすぎます(X3F ではありません)".into());
+    }
+    Ok(fs::read(path)?)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if !(3..=6).contains(&args.len()) {
@@ -18,7 +26,7 @@ fn main() -> ExitCode {
         let max_side = args.get(5).and_then(|v| v.parse().ok()).unwrap_or(1000);
         let run = || -> Result<(), Box<dyn std::error::Error>> {
             let t0 = std::time::Instant::now();
-            let loaded = x3tif_core::preview::Loaded::load(fs::read(&args[1])?)?;
+            let loaded = x3tif_core::preview::Loaded::load(read_input(&args[1])?)?;
             let t1 = std::time::Instant::now();
             let r = loaded.render(exposure, &Tuning::default(), max_side)?;
             let png = x3tif_core::png::encode_rgb8(r.image.width, r.image.height, &r.image.rgb)
@@ -54,7 +62,7 @@ fn main() -> ExitCode {
         }
     };
     let run = || -> Result<(), Box<dyn std::error::Error>> {
-        let data = fs::read(&args[1])?;
+        let data = read_input(&args[1])?;
         let mut out = BufWriter::new(fs::File::create(&args[2])?);
         x3tif_core::convert::x3f_to_tiff(data, &mut out, mode)?;
         Ok(())

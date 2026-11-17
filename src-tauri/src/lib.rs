@@ -118,6 +118,17 @@ fn output_path(input: &Path) -> PathBuf {
         .expect("unbounded range")
 }
 
+/// X3F を読み込む。巨大なファイル(X3F ではあり得ない大きさ)は、メモリに載せる前に断る。
+fn read_x3f(input: &Path) -> Result<Vec<u8>, String> {
+    let size = fs::metadata(input)
+        .map_err(|e| format!("読み込めません: {e}"))?
+        .len();
+    if size > x3tif_core::x3f::MAX_FILE_BYTES {
+        return Err("ファイルが大きすぎます(X3F ではありません)".into());
+    }
+    fs::read(input).map_err(|e| format!("読み込めません: {e}"))
+}
+
 fn check_x3f(input: &Path) -> Result<(), String> {
     let is_x3f = input
         .extension()
@@ -166,7 +177,7 @@ fn render_preview(
             Some((k, l)) if *k == key => Arc::clone(l),
             _ => {
                 *slot = None; // a failed load must not leave the previous file's picture behind
-                let data = fs::read(input).map_err(|e| format!("読み込めません: {e}"))?;
+                let data = read_x3f(input)?;
                 let l = Arc::new(Loaded::load(data).map_err(|e| e.to_string())?);
                 *slot = Some((key, Arc::clone(&l)));
                 l
@@ -213,7 +224,7 @@ async fn preview(
 
 fn convert_file(input: &Path, mode: Mode, progress: impl FnMut(f64)) -> Result<PathBuf, String> {
     check_x3f(input)?;
-    let data = fs::read(input).map_err(|e| format!("読み込めません: {e}"))?;
+    let data = read_x3f(input)?;
     let out = output_path(input);
     let tmp = out.with_extension("tif.part");
     let result = (|| {
