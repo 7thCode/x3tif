@@ -20,7 +20,7 @@ SD9〜SD15、SD1 など旧世代の X3F は対象外です(変換せず、エラ
     仕上げ用途には向きません。センサー値を、ビット深度分だけ
     左シフトして 16bit 全域に広げるだけです(14bit なら ×4、無損失)。倍率は XMP の `x3f:RawScale` に記録します。
   - **見たまま**: 黒レベル減算、ホワイトバランス(ファイルの設定)、色マトリクス、露出補正、緩いS字トーンカーブ、
-    ガンマを適用した 16bit TIFF です。色空間は sRGB(既定)か Adobe RGB を選べ、選んだ色空間の ICC プロファイルを埋め込みます(生データには埋め込みません。XMP の `x3f:ColorSpace` にも記録)。DP Merrill は CAMF の表で周辺の光量落ちと色かぶりを補正します。露出は既定で「自動」(ファイル内の JPEG プレビューと同じ明るさに合わせる。Photo Pro の出力と比べて合わせた機種は固定値で、sd Quattro は +1.0 EV、dp0 Quattro と DP1 Merrill は 0 EV。この 3 機種はトーンカーブも Photo Pro から測ったもの)で、
+    ガンマを適用した 16bit TIFF です。色空間は sRGB(既定)か Adobe RGB を選べ、選んだ色空間の ICC プロファイルを埋め込みます(生データには埋め込みません。XMP の `x3f:ColorSpace` にも記録)。DP Merrill は CAMF の表で周辺の光量落ちと色かぶりを補正します。露出は既定で「自動」(ファイル内の JPEG プレビューと同じ明るさに合わせる。Photo Pro の出力と比べて合わせた機種は固定値で、sd Quattro は +1.0 EV、dp0 Quattro と DP Merrill は 0 EV(DP2 / DP3 Merrill は DP1 の値、dp1〜dp3 Quattro は dp0 の値を、参照が無いまま流用)。この 3 系統はトーンカーブも Photo Pro から測ったもの)で、
     スライダーで −4〜+4 EV を手動指定もできます(値は XMP の `x3f:ExposureEV`)。色味はプレビューと一致しない場合があります。
     SIGMA Photo Pro の出力とは画素単位では一致しません(どの程度の差かは「検証」を参照)。出力は有効画像領域(遮光帯を除く)に切り出します。校正値が無いファイルは、生データのみ変換できます。
   黒レベル等の係数は XMP に入っているので、生データは Lightroom / Capture One / darktable 等で現像できます。
@@ -160,8 +160,9 @@ DP1 Merrill 26.5〜30.8 dB、sd Quattro 29.3〜34.8 dB。)
   画像ごとに赤・青が 1〜2% ずれます。3x3 の色マトリクスや WB ゲインを当てはめ直しても共通の補正にはなりませんでした。
 
 比較できているのは上の 3 機種・ISO 100 だけです。高感度、ほかの WB、ほかの機種(DP2 / DP3 Merrill、dp1〜dp3 Quattro、
-sd Quattro H)については、設定を記録した Photo Pro の参照がまだありません。DP2 / DP3 Merrill にはシェーディング補正だけが
-掛かり(同じ形式の表を持つ場合)、露出とトーンは従来のままです。dp1〜dp3 Quattro と sd Quattro H の仕上げは sd Quattro の値に従います。
+sd Quattro H)については、設定を記録した Photo Pro の参照がまだありません。DP2 / DP3 Merrill は参照が無いまま、DP1 Merrill と
+同じ処理(固定露出 0 EV、測ったトーンカーブ、シェーディング補正)にしています。測った値ではないので、参照が手に入ったら
+確かめる必要があります。dp1〜dp3 Quattro も同じ理由で、dp0 Quattro と同じ処理(固定露出 0 EV、測ったトーンカーブ、dp0 用の仕上げ)です。sd Quattro H の仕上げは sd Quattro の値に従います。
 
 ## ライセンス
 

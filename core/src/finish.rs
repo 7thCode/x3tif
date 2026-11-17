@@ -79,7 +79,7 @@ impl Params {
         core: 2.0,
     };
 
-    /// dp0 Quattro(CAMERAID 83)。Photo Pro 6.9.0 の既定設定の TIFF 5 枚(ISO 100)との RMSE(/255)で
+    /// dp0 Quattro(CAMERAID 83。dp1〜dp3 Quattro は参照が無いまま同じ値を使う)。Photo Pro 6.9.0 の既定設定の TIFF 5 枚(ISO 100)との RMSE(/255)で
     /// 決めた。sd Quattro の値のままだと 11.9/10.7/5.1/11.1/12.6 で、色差の高域は Photo Pro の
     /// 1/7 しか残らず(R−G、σ3 より細かい成分が 0.24〜0.39 対 2.0〜2.9)、輝度の振幅も全帯域で
     /// 0.70〜0.83 倍だった。ISO 100 の dp0 に粒状感の除去は要らない。除去をやめ、色差のぼかしを

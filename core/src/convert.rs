@@ -210,10 +210,10 @@ pub fn x3f_to_tiff_with_progress<W: Write>(
     Ok(())
 }
 
-/// 仕上げの強さは機種ごと: Photo Pro と比べて決めた dp0 Quattro は専用の値、それ以外の Quattro は
-/// これまでどおり sd Quattro に合わせた値。
+/// 仕上げの強さは機種ごと: Photo Pro と比べて決めた dp0 Quattro(と、参照が無いまま同じ扱いにした
+/// dp1〜dp3 Quattro)は専用の値、それ以外の Quattro は sd Quattro に合わせた値。
 fn finish_params(camf: &Camf) -> finish::Params {
-    if camf.number("CAMERAID") == Some(83.0) {
+    if matches!(camf.number("CAMERAID"), Some(id) if (80.0..=83.0).contains(&id)) {
         finish::Params::DP0_QUATTRO
     } else {
         finish::Params::SD_QUATTRO
@@ -635,7 +635,20 @@ mod tests {
                 },
             }])
         };
-        assert_eq!(finish_params(&camera(83.0)), finish::Params::DP0_QUATTRO);
+        for id in [80.0, 81.0, 82.0, 83.0] {
+            assert_eq!(
+                finish_params(&camera(id)),
+                finish::Params::DP0_QUATTRO,
+                "{id}"
+            );
+        }
+        for id in [41.0, 79.0, 84.0] {
+            assert_eq!(
+                finish_params(&camera(id)),
+                finish::Params::SD_QUATTRO,
+                "{id}"
+            );
+        }
         assert_eq!(finish_params(&camera(40.0)), finish::Params::SD_QUATTRO);
         assert_eq!(finish_params(&Camf::default()), finish::Params::SD_QUATTRO);
     }

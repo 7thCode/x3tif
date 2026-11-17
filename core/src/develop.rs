@@ -430,7 +430,8 @@ const SD_QUATTRO_WHITE: f64 = 252.0;
 /// ばらついていたのに)。表はその中央値(半段の箱の中心、全チャンネル)を sRGB エンコードの
 /// 0..255 に直したもの。Photo Pro はリニア 1.0 を超える値も肩で受けるので、表はリニア 2.0
 /// (`DP0_QUATTRO_WHITE`)まで続く。変更前は暗部が 12〜22/255 明るく、暗い 1 枚は中間調が
-/// 20〜57/255 暗かった。dp1/dp2/dp3 Quattro は測っていないので対象外。
+/// 20〜57/255 暗かった。dp1/dp2/dp3 Quattro(CAMERAID 80〜82)は参照が無いまま(ユーザーの指示で)
+/// 同じ表・同じ固定露出を使う。測った値ではないので、参照が手に入ったら確かめること。
 const DP0_QUATTRO_TONE: [(f64, f64); 20] = [
     (-8.75, 2.7),
     (-8.25, 4.1),
@@ -463,7 +464,9 @@ const DP0_QUATTRO_EXPOSURE_EV: f64 = 0.0;
 /// 「共通カーブを逆に引いた値 − 自分のリニア値(露出 0 EV)」の中央値は −0.02 / 0.00 / +0.02 /
 /// −0.11 / +0.03 段だった(カメラの JPEG に合わせる自動露出は +1.22〜+1.40 EV)。表は緑の中央値
 /// (半段の箱の中心)を sRGB エンコードに直したもの。箱の標本が少ない −3.75〜−2.75 は緑と
-/// 全チャンネルの中央値の間を取った。DP2 / DP3 Merrill は未測定で対象外。
+/// 全チャンネルの中央値の間を取った。DP2 / DP3 Merrill(CAMERAID 78)は同じセンサーと現像系なので、
+/// 参照が無いまま(ユーザーの指示で)同じ表・同じ固定露出を使う。測った値ではないので、参照が
+/// 手に入ったら確かめること。
 /// 表はシェーディング補正(`Shading`)を入れた後に測り直したもの。補正前は画像ごとに中間調が
 /// 最大 16/255 ばらついていたが、補正後は 5 枚が ±5/255 以内に重なる。
 const DP1_MERRILL_TONE: [(f64, f64); 16] = [
@@ -647,8 +650,10 @@ fn is_sd_quattro(camf: &Camf) -> bool {
 fn measured_tone(camf: &Camf) -> Option<&'static MeasuredTone> {
     match camf.number("CAMERAID").map(|v| v as u32) {
         Some(40) => Some(&SD_QUATTRO_MEASURED),
-        Some(77) => Some(&DP1_MERRILL_MEASURED),
-        Some(83) => Some(&DP0_QUATTRO_MEASURED),
+        // 78(DP2 / DP3 Merrill)は参照が無く、DP1 と同じ扱いにしている。
+        Some(77 | 78) => Some(&DP1_MERRILL_MEASURED),
+        // 80〜82(dp1〜dp3 Quattro)は参照が無く、dp0 と同じ扱いにしている。
+        Some(80..=83) => Some(&DP0_QUATTRO_MEASURED),
         _ => None,
     }
 }
@@ -1799,12 +1804,32 @@ mod tests {
     fn sd_quattro_auto_exposure_is_fixed_and_other_cameras_are_not() {
         let sd = Developer::new(&raw(), &with_camera(40.0), None, &Tuning::default()).unwrap();
         assert_eq!(sd.fixed_exposure(), Some(SD_QUATTRO_EXPOSURE_EV));
-        for camera in [41.0, 80.0, 78.0] {
+        for camera in [41.0, 42.0, 100.0] {
             let d = Developer::new(&raw(), &with_camera(camera), None, &Tuning::default()).unwrap();
             assert_eq!(d.fixed_exposure(), None, "camera {camera}");
         }
         let none = Developer::new(&raw(), &camf(1.0), None, &Tuning::default()).unwrap();
         assert_eq!(none.fixed_exposure(), None);
+    }
+
+    #[test]
+    fn dp1_to_dp3_quattro_use_the_dp0_quattro_exposure_and_curve() {
+        let dp0 = Developer::new(&raw(), &with_camera(83.0), None, &Tuning::default()).unwrap();
+        for camera in [80.0, 81.0, 82.0] {
+            let d = Developer::new(&raw(), &with_camera(camera), None, &Tuning::default()).unwrap();
+            assert_eq!(
+                d.fixed_exposure(),
+                Some(DP0_QUATTRO_EXPOSURE_EV),
+                "{camera}"
+            );
+            assert_eq!(d.curve_max, dp0.curve_max, "{camera}");
+            assert_eq!(d.curve, dp0.curve, "{camera}");
+        }
+        // 隣の ID(sd Quattro H など)には広がらない。
+        for camera in [79.0, 84.0, 41.0] {
+            let d = Developer::new(&raw(), &with_camera(camera), None, &Tuning::default()).unwrap();
+            assert_eq!(d.fixed_exposure(), None, "{camera}");
+        }
     }
 
     #[test]
@@ -1976,10 +2001,10 @@ mod tests {
     #[test]
     fn adobe_rgb_output_is_the_same_colour_as_the_srgb_output() {
         // sRGB の色域に収まる色は、どちらの色空間で書いても同じ色(リニア光)を指す。
-        // 78 は測ったカーブも赤の補正も持たない機種。
+        // 41(sd Quattro H)は測ったカーブも赤の補正も持たない機種。
         for px in [[400, 500, 600], [900, 700, 300], [1500, 1500, 1500]] {
-            let s = developed_in(ColorSpace::Srgb, 78.0, px).map(|v| v as f64 / 65535.0);
-            let a = developed_in(ColorSpace::AdobeRgb, 78.0, px).map(|v| v as f64 / 65535.0);
+            let s = developed_in(ColorSpace::Srgb, 41.0, px).map(|v| v as f64 / 65535.0);
+            let a = developed_in(ColorSpace::AdobeRgb, 41.0, px).map(|v| v as f64 / 65535.0);
             let tone = |e: f64| e + TONE_STRENGTH * (e * e * (3.0 - 2.0 * e) - e);
             // カーブを通る前のリニア値に戻して比べる(カーブは出力色空間のチャンネルごと)。
             let untone = |y: f64| {
@@ -2031,6 +2056,15 @@ mod tests {
     }
 
     #[test]
+    fn dp2_dp3_merrill_use_the_dp1_merrill_exposure_and_curve() {
+        let dp1 = Developer::new(&raw(), &with_camera(77.0), None, &Tuning::default()).unwrap();
+        let dp23 = Developer::new(&raw(), &with_camera(78.0), None, &Tuning::default()).unwrap();
+        assert_eq!(dp23.fixed_exposure(), Some(DP1_MERRILL_EXPOSURE_EV));
+        assert_eq!(dp23.curve_max, dp1.curve_max);
+        assert_eq!(dp23.curve, dp1.curve);
+    }
+
+    #[test]
     fn dp1_merrill_auto_exposure_is_fixed_and_curve_follows_the_measured_table() {
         let d = Developer::new(&raw(), &with_camera(77.0), None, &Tuning::default()).unwrap();
         assert_eq!(d.fixed_exposure(), Some(DP1_MERRILL_EXPOSURE_EV));
@@ -2075,7 +2109,7 @@ mod tests {
         // 飽和画素は白へ寄せるので 3 チャンネルが揃い、かつ 16bit の上限には張り付かない。
         assert!(row[1] > 64000 && row[1] < 65535, "{row:?}");
         // 測ったカーブを持たない機種は、これまでどおりリニア 1.0 が上限。
-        let other = Developer::new(&raw(), &with_camera(80.0), None, &Tuning::default()).unwrap();
+        let other = Developer::new(&raw(), &with_camera(41.0), None, &Tuning::default()).unwrap();
         assert_eq!(other.curve_max, 1.0);
     }
 
