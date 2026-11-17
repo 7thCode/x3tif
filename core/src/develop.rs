@@ -3,7 +3,8 @@
 //! * `Raw`: sensor values untouched, only shifted up to fill the 16 bit range (lossless).
 //! * `Developed`: black level, white balance, colour matrix, exposure and a tone curve, using the
 //!   calibration stored in the file's CAMF block. The exposure defaults to whatever makes the
-//!   picture as bright as the camera's own embedded JPEG preview.
+//!   picture as bright as the camera's own embedded JPEG preview; cameras measured against
+//!   Photo Pro (sd Quattro, dp0 Quattro, DP1 Merrill) use its fixed gain and tone curve instead.
 
 use crate::camf::Camf;
 use crate::x3f::{Error, Raw};
@@ -281,13 +282,17 @@ pub struct Developer {
     white: [f64; 3],
     /// raw-normalised RGB -> linear sRGB, with white balance gains and ISO scaling folded in.
     matrix: [[f64; 3]; 3],
-    /// sRGB-encoded 16 bit value for evenly spaced linear inputs in 0..=1.
+    /// sRGB-encoded 16 bit value for evenly spaced linear inputs in 0..=`curve_max`.
     curve: Vec<f64>,
+    /// カーブが受け取るリニア値の上限(測ったカーブを持つ機種は 1 を超えることがある)。
+    curve_max: f64,
     /// Per-channel linear gain applied before the curve (2^EV).
     gain: [f64; 3],
     tone: f64,
     /// Red-row correction applied to the finished picture, with the sRGB decoding it needs.
     red_row: Option<([f64; 3], Vec<f32>)>,
+    /// 場所ごとのゲイン(Merrill のシェーディング補正)。
+    shading: Option<Shading>,
     /// Exposure that `Exposure::Auto` stands for, when it does not depend on the picture.
     fixed_exposure: Option<f64>,
     pub white_balance: String,
@@ -349,6 +354,133 @@ const SD_QUATTRO_TONE: [(f64, f64); 17] = [
 /// Where a fully saturated sensor value ends up (Photo Pro's skies read 251-253).
 const SD_QUATTRO_WHITE: f64 = 252.0;
 
+/// dp0 Quattro (CAMERAID 83) も Photo Pro は絵を測らず、どのファイルも同じゲインと同じトーンカーブで
+/// 現像する。Photo Pro 6.9.0 の既定設定(露出 0、カラーモード Standard、ノイズリダクション既定)で
+/// 書き出した 5 枚(ISO 100、色温度 5000K。夕方の明るい場面から暗い場面まで)で、平坦な 16 画素
+/// ブロックの「カーブ前の自分のリニア値(log2、露出 0 EV)」に対する Photo Pro のエンコード値は、
+/// 中間調で 5 枚とも ±3/255 以内に重なった(カメラの JPEG に合わせる自動露出は −0.23〜+0.94 EV と
+/// ばらついていたのに)。表はその中央値(半段の箱の中心、全チャンネル)を sRGB エンコードの
+/// 0..255 に直したもの。Photo Pro はリニア 1.0 を超える値も肩で受けるので、表はリニア 2.0
+/// (`DP0_QUATTRO_WHITE`)まで続く。変更前は暗部が 12〜22/255 明るく、暗い 1 枚は中間調が
+/// 20〜57/255 暗かった。dp1/dp2/dp3 Quattro は測っていないので対象外。
+const DP0_QUATTRO_TONE: [(f64, f64); 20] = [
+    (-8.75, 2.7),
+    (-8.25, 4.1),
+    (-7.75, 6.2),
+    (-7.25, 9.3),
+    (-6.75, 13.4),
+    (-6.25, 18.7),
+    (-5.75, 26.1),
+    (-5.25, 36.2),
+    (-4.75, 49.4),
+    (-4.25, 67.9),
+    (-3.75, 90.1),
+    (-3.25, 118.6),
+    (-2.75, 148.4),
+    (-2.25, 175.4),
+    (-1.75, 199.2),
+    (-1.25, 219.3),
+    (-0.75, 236.4),
+    (-0.25, 249.4),
+    (0.25, 253.4),
+    (0.75, 254.6),
+];
+/// カーブが白に届くリニア値の log2 と、そのエンコード値。
+const DP0_QUATTRO_WHITE: (f64, f64) = (1.0, 255.0);
+/// dp0 Quattro の「自動」露出。上の表が 0 EV で測ってあるので 0。
+const DP0_QUATTRO_EXPOSURE_EV: f64 = 0.0;
+
+/// DP1 Merrill (CAMERAID 77) も同じで、Photo Pro は絵を測らない。Photo Pro 6.9.0 の既定設定(露出 0、
+/// カラーモード Standard、WB オート、ISO 100)の 5 枚で、平坦な 16 画素ブロックの緑について
+/// 「共通カーブを逆に引いた値 − 自分のリニア値(露出 0 EV)」の中央値は −0.02 / 0.00 / +0.02 /
+/// −0.11 / +0.03 段だった(カメラの JPEG に合わせる自動露出は +1.22〜+1.40 EV)。表は緑の中央値
+/// (半段の箱の中心)を sRGB エンコードに直したもの。箱の標本が少ない −3.75〜−2.75 は緑と
+/// 全チャンネルの中央値の間を取った。DP2 / DP3 Merrill は未測定で対象外。
+/// 表はシェーディング補正(`Shading`)を入れた後に測り直したもの。補正前は画像ごとに中間調が
+/// 最大 16/255 ばらついていたが、補正後は 5 枚が ±5/255 以内に重なる。
+const DP1_MERRILL_TONE: [(f64, f64); 16] = [
+    (-8.25, 6.5),
+    (-7.75, 9.5),
+    (-7.25, 13.3),
+    (-6.75, 19.1),
+    (-6.25, 26.5),
+    (-5.75, 35.3),
+    (-5.25, 47.4),
+    (-4.75, 63.9),
+    (-4.25, 85.8),
+    (-3.75, 111.0),
+    (-3.25, 131.0),
+    (-2.75, 162.0),
+    (-2.25, 190.0),
+    (-1.75, 216.5),
+    (-1.25, 238.5),
+    (-0.75, 254.0),
+];
+/// カーブが白に届くリニア値の log2 と、そのエンコード値。
+const DP1_MERRILL_WHITE: (f64, f64) = (-0.25, 255.0);
+/// DP1 Merrill の「自動」露出。上の表が 0 EV で測ってあるので 0。
+const DP1_MERRILL_EXPOSURE_EV: f64 = 0.0;
+
+/// Photo Pro の出力から測ったトーンカーブ(機種ごと)。
+struct MeasuredTone {
+    /// (カーブ前のリニア値の log2, sRGB エンコード値 0..255)。
+    nodes: &'static [(f64, f64)],
+    /// 白に届く点。ここまでがカーブの定義域になる。
+    white: (f64, f64),
+    /// 「自動」露出が意味する固定の EV。
+    exposure_ev: f64,
+}
+
+const SD_QUATTRO_MEASURED: MeasuredTone = MeasuredTone {
+    nodes: &SD_QUATTRO_TONE,
+    white: (0.0, SD_QUATTRO_WHITE),
+    exposure_ev: SD_QUATTRO_EXPOSURE_EV,
+};
+
+const DP0_QUATTRO_MEASURED: MeasuredTone = MeasuredTone {
+    nodes: &DP0_QUATTRO_TONE,
+    white: DP0_QUATTRO_WHITE,
+    exposure_ev: DP0_QUATTRO_EXPOSURE_EV,
+};
+
+const DP1_MERRILL_MEASURED: MeasuredTone = MeasuredTone {
+    nodes: &DP1_MERRILL_TONE,
+    white: DP1_MERRILL_WHITE,
+    exposure_ev: DP1_MERRILL_EXPOSURE_EV,
+};
+
+impl MeasuredTone {
+    /// カーブが受け取るリニア値の上限。
+    fn max_linear(&self) -> f64 {
+        2f64.powf(self.white.0)
+    }
+
+    /// リニア値 `l` に対する Photo Pro のエンコード値(0..=1)。
+    fn curve(&self, l: f64) -> f64 {
+        if l <= 0.0 {
+            return 0.0;
+        }
+        let first = self.nodes[0];
+        let x = l.log2();
+        let y = if x < first.0 {
+            // 測った範囲より下は黒までの直線。
+            first.1 * 2f64.powf(x - first.0)
+        } else {
+            let mut nodes = self.nodes.to_vec();
+            nodes.push(self.white);
+            monotone_cubic(&nodes, x.min(self.white.0))
+        };
+        (y / 255.0).clamp(0.0, 1.0)
+    }
+
+    /// 強さ 0 で素の sRGB、`TONE_STRENGTH`(既定)で Photo Pro のカーブ、それ以上でさらに強く。
+    fn encode(&self, l: f64, tone: f64) -> f64 {
+        let e = srgb_encode(l.clamp(0.0, 1.0));
+        (e + tone / TONE_STRENGTH * (self.curve(l.clamp(0.0, self.max_linear())) - e))
+            .clamp(0.0, 1.0)
+    }
+}
+
 /// Monotone cubic (Fritsch-Carlson) interpolation through `nodes`, extended to both ends.
 fn monotone_cubic(nodes: &[(f64, f64)], x: f64) -> f64 {
     let n = nodes.len();
@@ -377,28 +509,16 @@ fn monotone_cubic(nodes: &[(f64, f64)], x: f64) -> f64 {
 }
 
 /// Photo Pro's sd Quattro curve for a linear value `l` in 0..=1, encoded 0..=1.
+#[cfg(test)]
 fn sd_quattro_curve(l: f64) -> f64 {
-    if l <= 0.0 {
-        return 0.0;
-    }
-    let first = SD_QUATTRO_TONE[0];
-    let x = l.log2();
-    let y = if x < first.0 {
-        // Below the measured range the curve is a straight line to black.
-        first.1 * 2f64.powf(x - first.0)
-    } else {
-        let mut nodes = SD_QUATTRO_TONE.to_vec();
-        nodes.push((0.0, SD_QUATTRO_WHITE));
-        monotone_cubic(&nodes, x.min(0.0))
-    };
-    (y / 255.0).clamp(0.0, 1.0)
+    SD_QUATTRO_MEASURED.curve(l)
 }
 
 /// `encode_with` for the sd Quattro: the strength moves the curve between plain sRGB (0) and
 /// Photo Pro's (`TONE_STRENGTH`, the default), and beyond it for more contrast.
+#[cfg(test)]
 fn encode_sd_quattro(l: f64, tone: f64) -> f64 {
-    let e = srgb_encode(l.clamp(0.0, 1.0));
-    (e + tone / TONE_STRENGTH * (sd_quattro_curve(l.clamp(0.0, 1.0)) - e)).clamp(0.0, 1.0)
+    SD_QUATTRO_MEASURED.encode(l, tone)
 }
 
 /// Linear light for every 16 bit sRGB-encoded value.
@@ -455,6 +575,16 @@ fn is_sd_quattro(camf: &Camf) -> bool {
     camf.number("CAMERAID") == Some(40.0)
 }
 
+/// Photo Pro のカーブを測ってある機種なら、その表。
+fn measured_tone(camf: &Camf) -> Option<&'static MeasuredTone> {
+    match camf.number("CAMERAID").map(|v| v as u32) {
+        Some(40) => Some(&SD_QUATTRO_MEASURED),
+        Some(77) => Some(&DP1_MERRILL_MEASURED),
+        Some(83) => Some(&DP0_QUATTRO_MEASURED),
+        _ => None,
+    }
+}
+
 fn wb_from_code(code: u32) -> &'static str {
     match code {
         2 => "Sunlight",
@@ -470,10 +600,14 @@ fn wb_from_code(code: u32) -> &'static str {
     }
 }
 
-/// Photo Pro renders Merrill files with a red gain about 4.5% above the file's white balance
-/// gain (fitted against its TIFF output; the camera JPEGs of four more files agree within
-/// 1.038-1.044). Quattro needs no such trim (0.8%).
-const MERRILL_RED_TRIM: f64 = 1.04;
+/// Photo Pro renders Merrill files with a red gain above the file's white balance gain. It was
+/// 1.04 (fitted against its TIFF output; the camera JPEGs of four more files agreed within
+/// 1.038-1.044) while the picture had no shading correction. With `Shading` in place the same
+/// comparison on five DP1 Merrill files (Photo Pro 6.9.0, defaults) left R−G at +3.3 / +3.1 /
+/// +2.4 / +2.2 / +0.8 of 255; 1.5% less red brings it to +1.4 / +0.9 / +0.2 / +0.1 / −1.1 and the
+/// RMS error from 8.32 / 7.35 / 7.97 / 12.01 / 8.80 to 8.17 / 7.26 / 7.94 / 11.89 / 8.74, and 3%
+/// less overshoots (−0.5 … −3.0). Quattro needs no such trim (0.8%).
+const MERRILL_RED_TRIM: f64 = 1.024;
 
 /// The table's gains are relative to a green gain of about 0.855, while the per-white-balance
 /// `WBGain` entries are relative to 1. Found by comparing with those entries (about 1.16), then
@@ -481,8 +615,14 @@ const MERRILL_RED_TRIM: f64 = 1.04;
 /// (all at 5000K) agree on red 1.18-1.19 and blue 1.16-1.19 (a single 1.17 left red about 4/255
 /// low). Calibrate on the finished output, not on a raw-mode TIFF: that one lacks the highlight
 /// pixel repair, and the colour matrix amplifies a few percent of green into ~20% of blue.
+///
+/// 青は、dp0 Quattro に Photo Pro のトーンカーブ(`DP0_QUATTRO_TONE`)を入れたあとで測り直した。
+/// Photo Pro 6.9.0 の既定設定の TIFF 5 枚(5000K)に対し、1.17 のままだと B−G が
+/// +3.4/+4.1/+1.6/+7.0/+7.6(/255)と 5 枚とも青く、B−G が 0 になる倍率は 0.983/0.982/0.986/0.975/0.976
+/// 倍に揃った。0.98 倍(1.147)で B−G は −0.5/−0.3/−0.7/+1.4/+1.3、R−G は +0.5/+1.2/+0.2/+1.1/−0.2。
+/// 赤は動かさない(1.005 倍にすると R−G が +0.5〜+2.0 に悪化)。
 const COLOR_TEMP_RED_SCALE: f64 = 1.185;
-const COLOR_TEMP_BLUE_SCALE: f64 = 1.17;
+const COLOR_TEMP_BLUE_SCALE: f64 = 1.147;
 
 /// White balance by colour temperature (Quattro "ColorTemp" setting): the gains and colour
 /// matrix are interpolated from `ColorTempTableInfo` at the file's `ColorTempValue`. The table has
@@ -589,13 +729,14 @@ impl Developer {
             }
         }
         let sd_quattro = is_sd_quattro(camf);
+        let measured = measured_tone(camf);
+        let curve_max = measured.map_or(1.0, MeasuredTone::max_linear);
         let mut curve: Vec<f64> = (0..=CURVE_SIZE)
             .map(|i| {
-                let l = i as f64 / CURVE_SIZE as f64;
-                let e = if sd_quattro {
-                    encode_sd_quattro(l, tuning.tone)
-                } else {
-                    encode_with(l, tuning.tone)
+                let l = i as f64 / CURVE_SIZE as f64 * curve_max;
+                let e = match measured {
+                    Some(m) => m.encode(l, tuning.tone),
+                    None => encode_with(l, tuning.tone),
                 };
                 e * 65535.0
             })
@@ -609,10 +750,12 @@ impl Developer {
             white: [max; 3],
             matrix,
             curve,
+            curve_max,
             gain: [1.0; 3],
             tone: tuning.tone,
             red_row: sd_quattro.then(|| (SD_QUATTRO_RED_ROW, srgb_decoding())),
-            fixed_exposure: sd_quattro.then_some(SD_QUATTRO_EXPOSURE_EV),
+            shading: Shading::new(raw, camf),
+            fixed_exposure: measured.map(|m| m.exposure_ev),
             white_balance: name,
         })
     }
@@ -694,19 +837,40 @@ impl Developer {
         }
     }
 
-    /// Converts one row of interleaved raw RGB (sensor units) in place.
+    /// Converts one row of interleaved raw RGB (sensor units) in place. The pixels have no
+    /// position, so position-dependent corrections are not applied.
     pub fn apply(&self, row: &mut [u16]) {
         for px in row.chunks_exact_mut(3) {
-            let n: [f64; 3] = std::array::from_fn(|c| {
+            self.apply_pixel(px, [1.0; 3]);
+        }
+    }
+
+    /// `apply` と同じだが、画素の位置(センサー全体の座標。行 `y`、`i` 番目の画素の列は
+    /// `x_of(i)`)を使ってシェーディング補正も掛ける。
+    pub fn apply_at(&self, row: &mut [u16], y: usize, x_of: impl Fn(usize) -> usize) {
+        let Some(shading) = &self.shading else {
+            return self.apply(row);
+        };
+        let line = shading.line(y);
+        for (i, px) in row.chunks_exact_mut(3).enumerate() {
+            self.apply_pixel(px, shading.at(&line, x_of(i)));
+        }
+    }
+
+    fn apply_pixel(&self, px: &mut [u16], shade: [f64; 3]) {
+        {
+            let raw: [f64; 3] = std::array::from_fn(|c| {
                 ((px[c] as f64 - self.black[c]) / (self.white[c] - self.black[c])).max(0.0)
             });
+            let n: [f64; 3] = std::array::from_fn(|c| raw[c] * shade[c]);
             let mut lin: [f64; 3] = std::array::from_fn(|c| {
                 let m = &self.matrix[c];
-                ((m[0] * n[0] + m[1] * n[1] + m[2] * n[2]) * self.gain[c]).clamp(0.0, 1.0)
+                ((m[0] * n[0] + m[1] * n[1] + m[2] * n[2]) * self.gain[c])
+                    .clamp(0.0, self.curve_max)
             });
             // A saturated channel under-reports its colour, which turns bright skies yellow-green.
             // Blend those pixels towards white as the brightest channel nears saturation.
-            let peak = n.iter().cloned().fold(0.0, f64::max);
+            let peak = raw.iter().cloned().fold(0.0, f64::max);
             let t = ((peak - CLIP_START) / (1.0 - CLIP_START)).clamp(0.0, 1.0);
             if t > 0.0 {
                 let top = lin.iter().cloned().fold(0.0, f64::max);
@@ -715,7 +879,7 @@ impl Developer {
                 }
             }
             for (out, l) in px.iter_mut().zip(lin) {
-                let pos = l * CURVE_SIZE as f64;
+                let pos = l / self.curve_max * CURVE_SIZE as f64;
                 let i = (pos as usize).min(CURVE_SIZE - 1);
                 let f = pos - i as f64;
                 *out = (self.curve[i] * (1.0 - f) + self.curve[i + 1] * f).round() as u16;
@@ -725,6 +889,121 @@ impl Developer {
                 px[0] = (srgb_encode(l.clamp(0.0, 1.0)) * 65535.0).round() as u16;
             }
         }
+    }
+}
+
+/// DP Merrill のシェーディング補正(周辺の光量落ちと、層ごとに違う色かぶり)。
+///
+/// CAMF には絞りごと(`SpatialGain_Fstop` = 2.8 / 4 / 8)に、センサー全体を覆う 52x78 の表
+/// `SpatialGain{G,B}_{絞りの番号}_{INF,MOD}` がある(0〜255 の整数、中央が 0〜1、隅が最大)。
+/// 換算式は CAMF に無いので、Photo Pro 6.9.0 の既定設定の TIFF 5 枚(DP1 Merrill、F2.8〜5.6)から
+/// 求めた: 平坦な 16 画素ブロックごとに「Photo Pro と同じ色になるために各層に必要なゲイン」を
+/// 逆算すると、表の値と相関 0.84〜0.97 で直線に乗る。赤の表は無く、赤に必要なゲインは緑の表より
+/// 青の表によく乗る(残差 0.033〜0.053 対 0.036〜0.060)。
+///
+/// 層ごとのゲイン = 1 + 表の値 / `SHADING_SCALE`(赤は青の表を `SHADING_RED_SCALE` で)。
+/// 灰色に近いブロックの「Photo Pro との色の比のずれ」の場所によるばらつき(段、5 枚の平均)は、
+/// 補正なしで 青/緑 0.144・赤/緑 0.095、この式で 0.029・0.037。係数 400〜520 では 0.030〜0.034 と
+/// 平らで、赤を緑の表にすると 0.065、赤を補正しないと 0.156 に悪化する。絞りの間の補間方法と
+/// INF / MOD の違いは 0.002 以内なので、絞りは log2 で補間し、表は INF だけを使う。
+/// 画像ごとの直線の傾きは 1/380〜1/805 とばらつく(F2.8 の 2 枚が緩い)。明るさの周辺落ちには
+/// まだ合わせ切れていない。
+struct Shading {
+    rows: usize,
+    cols: usize,
+    /// 層(R, G, B)ごとのゲインの表。
+    gain: [Vec<f32>; 3],
+    width: usize,
+    height: usize,
+}
+
+const SHADING_SCALE: f64 = 450.0;
+const SHADING_RED_SCALE: f64 = 435.0;
+/// 表の大きさの上限(壊れた CAMF で巨大な表を作らない)。
+const SHADING_MAX_CELLS: usize = 1 << 16;
+
+impl Shading {
+    fn new(raw: &Raw, camf: &Camf) -> Option<Shading> {
+        let Raw::Merrill { width, height, .. } = raw else {
+            return None;
+        };
+        if *width < 2 || *height < 2 {
+            return None;
+        }
+        let stops = camf.matrix("SpatialGain_Fstop")?;
+        let aperture = camf.number("CaptureAperture").filter(|a| *a > 0.0)?;
+        if stops.iter().any(|f| f.is_nan() || *f <= 0.0) {
+            return None;
+        }
+        // 絞り: 隣り合う 2 つの表を log2 で混ぜる。範囲の外は端の表。
+        let hi = stops
+            .iter()
+            .position(|&f| f >= aperture)
+            .unwrap_or(stops.len() - 1);
+        let lo = hi.saturating_sub(1);
+        let t = if hi == lo || stops[hi] <= stops[lo] {
+            1.0
+        } else {
+            ((aperture / stops[lo]).log2() / (stops[hi] / stops[lo]).log2()).clamp(0.0, 1.0)
+        };
+        let table = |chan: &str, scale: f64| -> Option<(usize, usize, Vec<f32>)> {
+            let mut out: Option<(usize, usize, Vec<f32>)> = None;
+            for (index, w) in [(lo, 1.0 - t), (hi, t)] {
+                if w == 0.0 {
+                    continue;
+                }
+                let (dims, values) =
+                    camf.matrix_with_dims(&format!("SpatialGain{chan}_{index}_INF"))?;
+                if dims.len() != 2
+                    || dims[0] < 2
+                    || dims[1] < 2
+                    || values.len() > SHADING_MAX_CELLS
+                    || values.iter().any(|v| !(0.0..=65535.0).contains(v))
+                {
+                    return None;
+                }
+                let o = out.get_or_insert_with(|| (dims[0], dims[1], vec![1.0; values.len()]));
+                if (o.0, o.1) != (dims[0], dims[1]) {
+                    return None;
+                }
+                for (a, v) in o.2.iter_mut().zip(values) {
+                    *a += (w * v / scale) as f32;
+                }
+            }
+            out
+        };
+        let g = table("G", SHADING_SCALE)?;
+        let b = table("B", SHADING_SCALE).filter(|b| (b.0, b.1) == (g.0, g.1))?;
+        let r = table("B", SHADING_RED_SCALE)?;
+        Some(Shading {
+            rows: g.0,
+            cols: g.1,
+            gain: [r.2, g.2, b.2],
+            width: *width,
+            height: *height,
+        })
+    }
+
+    /// 行 `y` での、格子の列ごとのゲイン。
+    fn line(&self, y: usize) -> [Vec<f32>; 3] {
+        let pos = y.min(self.height - 1) as f64 / (self.height - 1).max(1) as f64
+            * (self.rows - 1) as f64;
+        let r = (pos as usize).min(self.rows - 2);
+        let f = (pos - r as f64) as f32;
+        std::array::from_fn(|c| {
+            let g = &self.gain[c];
+            (0..self.cols)
+                .map(|i| g[r * self.cols + i] * (1.0 - f) + g[(r + 1) * self.cols + i] * f)
+                .collect()
+        })
+    }
+
+    fn at(&self, line: &[Vec<f32>; 3], x: usize) -> [f64; 3] {
+        let pos =
+            x.min(self.width - 1) as f64 / (self.width - 1).max(1) as f64 * (self.cols - 1) as f64;
+        let i = (pos as usize).min(self.cols - 2);
+        let f = pos - i as f64;
+        std::array::from_fn(|c| line[c][i] as f64 * (1.0 - f) + line[c][i + 1] as f64 * f)
     }
 }
 
@@ -1181,6 +1460,51 @@ mod tests {
     }
 
     #[test]
+    fn repair_highlight_pixels_on_a_single_pixel_layer_does_not_panic() {
+        // 隣の画素が 1 つも無い 1x1 の層(壊れたファイル)。そのまま残す。
+        let mut raw = Raw::Quattro {
+            low_width: 1,
+            low_height: 1,
+            low: vec![50; 3],
+            top_width: 2,
+            top_height: 2,
+            top: vec![0; 4],
+        };
+        repair_highlight_pixels(
+            &mut raw,
+            &Camf(vec![m("HighlightPixelsInfo", &[0.0, 0.0, 2.0, 2.0])]),
+        );
+        let Raw::Quattro { low, .. } = &raw else {
+            unreachable!()
+        };
+        assert_eq!(low, &[50; 3]);
+    }
+
+    #[test]
+    fn white_balance_names_match_the_keys_real_files_use() {
+        // 実ファイル(dp1 Merrill / dp0 Quattro / sd Quattro)の CAMF のキーは Shade / Fluorescent。
+        // 旧いヘッダの綴り(Shadow / Florescent)はそこへ寄せる。逆向きにすると引けなくなり、
+        // 黙って Auto に落ちる。
+        assert_eq!(canonical_wb("Shadow"), "Shade");
+        assert_eq!(canonical_wb("Florescent"), "Fluorescent");
+        assert_eq!(wb_from_code(3), "Shade");
+        assert_eq!(wb_from_code(6), "Fluorescent");
+        let mut c = camf(3.0);
+        c.0.retain(|e| !e.name.starts_with("WhiteBalance"));
+        c.0.push(m("WhiteBalance", &[3.0]));
+        c.0.push(props(
+            "WhiteBalanceGains",
+            &[("Auto", "AutoGain"), ("Shade", "SunGain")],
+        ));
+        c.0.push(props(
+            "WhiteBalanceColorCorrections",
+            &[("Auto", "AutoCC"), ("Shade", "SunCC")],
+        ));
+        let d = Developer::new(&raw(), &c, None, &Tuning::default()).unwrap();
+        assert_eq!(d.white_balance, "Shade");
+    }
+
+    #[test]
     fn autofocus_grid_pixels_are_interpolated_for_sd_quattro_only() {
         let quattro = || Raw::Quattro {
             low_width: 4,
@@ -1321,7 +1645,7 @@ mod tests {
         row
     }
 
-    /// Raw pixel at `level` in green and blue whose red the test's Merrill trim (x1.04) brings to
+    /// Raw pixel at `level` in green and blue whose red the test's Merrill trim brings to
     /// the same level (black is 100).
     fn neutral(level: u16) -> [u16; 3] {
         [
@@ -1336,8 +1660,9 @@ mod tests {
         let red_row_sum: f64 = SD_QUATTRO_RED_ROW.iter().sum();
         assert!((red_row_sum - 1.0).abs() < 1e-12);
         // A raw pixel that comes out neutral still does with the correction.
+        // 生の値は整数なので、赤の補正を割り戻した値の丸めで 16bit の数レベルずれる。
         let plain = develop_pixel(neutral(2000), false);
-        assert!(plain[0].abs_diff(plain[1]) <= 2, "{plain:?}");
+        assert!(plain[0].abs_diff(plain[1]) <= 8, "{plain:?}");
         let gray = develop_pixel(neutral(2000), true);
         assert!(
             gray.iter().zip(plain).all(|(a, b)| a.abs_diff(b) <= 2),
@@ -1365,12 +1690,205 @@ mod tests {
     fn sd_quattro_auto_exposure_is_fixed_and_other_cameras_are_not() {
         let sd = Developer::new(&raw(), &with_camera(40.0), None, &Tuning::default()).unwrap();
         assert_eq!(sd.fixed_exposure(), Some(SD_QUATTRO_EXPOSURE_EV));
-        for camera in [41.0, 83.0, 78.0] {
+        for camera in [41.0, 80.0, 78.0] {
             let d = Developer::new(&raw(), &with_camera(camera), None, &Tuning::default()).unwrap();
             assert_eq!(d.fixed_exposure(), None, "camera {camera}");
         }
         let none = Developer::new(&raw(), &camf(1.0), None, &Tuning::default()).unwrap();
         assert_eq!(none.fixed_exposure(), None);
+    }
+
+    #[test]
+    fn dp0_quattro_auto_exposure_is_fixed_at_zero_ev() {
+        let d = Developer::new(&raw(), &with_camera(83.0), None, &Tuning::default()).unwrap();
+        assert_eq!(d.fixed_exposure(), Some(DP0_QUATTRO_EXPOSURE_EV));
+        assert_eq!(d.curve_max, 2.0);
+    }
+
+    /// 2x3 の補正表を持つ Merrill の CAMF(絞り 2.8 と 8 の 2 段)。
+    fn shaded_camf(aperture: f64) -> Camf {
+        let table = |name: &str, values: &[f64]| Entry {
+            name: name.into(),
+            value: Value::Matrix {
+                dims: vec![2, 3],
+                values: values.to_vec(),
+            },
+        };
+        let mut c = with_camera(77.0);
+        c.0.push(m("SpatialGain_Fstop", &[2.8, 8.0]));
+        c.0.push(m("CaptureAperture", &[aperture]));
+        c.0.push(table(
+            "SpatialGainG_0_INF",
+            &[90.0, 0.0, 90.0, 90.0, 0.0, 90.0],
+        ));
+        c.0.push(table(
+            "SpatialGainB_0_INF",
+            &[180.0, 0.0, 180.0, 180.0, 0.0, 180.0],
+        ));
+        c.0.push(table("SpatialGainG_1_INF", &[0.0; 6]));
+        c.0.push(table("SpatialGainB_1_INF", &[0.0; 6]));
+        c
+    }
+
+    fn big_raw() -> Raw {
+        Raw::Merrill {
+            width: 9,
+            height: 5,
+            rgb: vec![100u16; 9 * 5 * 3],
+        }
+    }
+
+    #[test]
+    fn shading_gain_is_one_in_the_centre_and_follows_the_tables_at_the_edges() {
+        let s = Shading::new(&big_raw(), &shaded_camf(2.8)).unwrap();
+        let line = s.line(2);
+        let centre = s.at(&line, 4);
+        assert!(centre.iter().all(|g| (g - 1.0).abs() < 1e-6), "{centre:?}");
+        let edge = s.at(&line, 0);
+        assert!((edge[1] - (1.0 + 90.0 / SHADING_SCALE)).abs() < 1e-6);
+        assert!((edge[2] - (1.0 + 180.0 / SHADING_SCALE)).abs() < 1e-6);
+        // 赤は青の表を使う。
+        assert!((edge[0] - (1.0 + 180.0 / SHADING_RED_SCALE)).abs() < 1e-6);
+        // 格子の間は直線で補間し、範囲の外の座標は端に丸める。
+        let between = s.at(&line, 2);
+        assert!((between[1] - (1.0 + 45.0 / SHADING_SCALE)).abs() < 1e-6);
+        assert_eq!(s.at(&line, 8), s.at(&line, 1000));
+        assert_eq!(s.at(&s.line(4), 0), s.at(&s.line(99), 0));
+    }
+
+    #[test]
+    fn shading_tables_are_blended_between_the_apertures() {
+        let gain = |aperture: f64| {
+            let s = Shading::new(&big_raw(), &shaded_camf(aperture)).unwrap();
+            s.at(&s.line(0), 0)[1]
+        };
+        let (open, closed) = (1.0 + 90.0 / SHADING_SCALE, 1.0);
+        assert!((gain(2.8) - open).abs() < 1e-6);
+        assert!((gain(8.0) - closed).abs() < 1e-6);
+        // 範囲の外は端の表。
+        assert!((gain(1.4) - open).abs() < 1e-6);
+        assert!((gain(16.0) - closed).abs() < 1e-6);
+        // 間は log2 で混ぜる(2.8 と 8 の幾何平均でちょうど半分)。
+        let mid = gain((2.8f64 * 8.0).sqrt());
+        assert!((mid - (open + closed) / 2.0).abs() < 1e-4, "{mid}");
+    }
+
+    #[test]
+    fn shading_is_skipped_when_the_tables_are_missing_or_damaged() {
+        // 表が無い機種、Quattro。
+        assert!(Shading::new(&big_raw(), &with_camera(77.0)).is_none());
+        let quattro = Raw::Quattro {
+            low_width: 2,
+            low_height: 2,
+            low: vec![100; 12],
+            top_width: 4,
+            top_height: 4,
+            top: vec![100; 16],
+        };
+        assert!(Shading::new(&quattro, &shaded_camf(2.8)).is_none());
+        // 絞りが無い・0・非数。
+        for bad in [0.0, -1.0, f64::NAN] {
+            assert!(
+                Shading::new(&big_raw(), &shaded_camf(bad)).is_none(),
+                "{bad}"
+            );
+        }
+        // 表の大きさが食い違う、値が範囲外、1 行しかない。
+        let damage = |name: &str, dims: Vec<usize>, values: Vec<f64>| {
+            let mut c = shaded_camf(2.8);
+            let e = c.0.iter_mut().find(|e| e.name == name).unwrap();
+            e.value = Value::Matrix { dims, values };
+            c
+        };
+        for c in [
+            damage("SpatialGainB_0_INF", vec![3, 2], vec![0.0; 6]),
+            damage(
+                "SpatialGainG_0_INF",
+                vec![2, 3],
+                vec![0.0, 0.0, f64::NAN, 0.0, 0.0, 0.0],
+            ),
+            damage("SpatialGainG_0_INF", vec![2, 3], vec![-5.0; 6]),
+            damage("SpatialGainG_0_INF", vec![1, 6], vec![0.0; 6]),
+            damage("SpatialGainG_0_INF", vec![2, 4], vec![0.0; 6]),
+            damage("SpatialGain_Fstop", vec![2], vec![2.8, 0.0]),
+        ] {
+            assert!(Shading::new(&big_raw(), &c).is_none());
+        }
+        // 1 画素幅の画像では格子に割り当てられない。
+        let thin = Raw::Merrill {
+            width: 1,
+            height: 5,
+            rgb: vec![100; 15],
+        };
+        assert!(Shading::new(&thin, &shaded_camf(2.8)).is_none());
+    }
+
+    #[test]
+    fn apply_at_brightens_the_edges_and_apply_ignores_the_position() {
+        let d = Developer::new(&big_raw(), &shaded_camf(2.8), None, &Tuning::default()).unwrap();
+        let px = [900u16, 900, 900];
+        let mut plain = px;
+        d.apply(&mut plain);
+        let mut row: Vec<u16> = px.repeat(9);
+        d.apply_at(&mut row, 2, |i| i);
+        // 中央はゲイン 1 なので位置なしと同じ、端は明るい。
+        assert_eq!(&row[4 * 3..5 * 3], &plain);
+        assert!(row[1] > plain[1] && row[8 * 3 + 1] > plain[1], "{row:?}");
+        // 表の無い機種では apply と同じ。
+        let d = Developer::new(&big_raw(), &with_camera(77.0), None, &Tuning::default()).unwrap();
+        let (mut a, mut b) = (px, px);
+        d.apply(&mut a);
+        d.apply_at(&mut b, 0, |_| 0);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn dp1_merrill_auto_exposure_is_fixed_and_curve_follows_the_measured_table() {
+        let d = Developer::new(&raw(), &with_camera(77.0), None, &Tuning::default()).unwrap();
+        assert_eq!(d.fixed_exposure(), Some(DP1_MERRILL_EXPOSURE_EV));
+        let m = &DP1_MERRILL_MEASURED;
+        assert!((d.curve_max - m.max_linear()).abs() < 1e-12);
+        for &(x, y) in m.nodes {
+            assert!((m.curve(2f64.powf(x)) * 255.0 - y).abs() < 1e-6, "{x}");
+        }
+        // 白に届く点より上は白のまま、表は単調。
+        assert_eq!(m.curve(m.max_linear()), 1.0);
+        assert_eq!(m.curve(4.0), 1.0);
+        assert!(m.nodes.windows(2).all(|w| w[0].1 < w[1].1));
+        assert_eq!(m.curve(0.0), 0.0);
+    }
+
+    #[test]
+    fn dp0_quattro_curve_follows_the_measured_table_up_to_twice_linear_white() {
+        let m = &DP0_QUATTRO_MEASURED;
+        for &(x, y) in m.nodes {
+            let got = m.curve(2f64.powf(x)) * 255.0;
+            assert!((got - y).abs() < 0.01, "log2 {x}: {got} vs {y}");
+        }
+        assert_eq!(m.curve(0.0), 0.0);
+        // リニア 1.0 ではまだ白に届かず、2.0 で届く。その先は変わらない。
+        assert!(m.curve(1.0) < 254.0 / 255.0);
+        assert!((m.curve(2.0) - 1.0).abs() < 1e-9);
+        assert_eq!(m.encode(5.0, TONE_STRENGTH), m.encode(2.0, TONE_STRENGTH));
+        // 強さ 0 は素の sRGB。
+        for l in [0.001, 0.18, 0.9] {
+            assert!((m.encode(l, 0.0) - srgb_encode(l)).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn dp0_quattro_lookup_table_is_monotone_and_keeps_highlights_above_linear_white() {
+        let d = Developer::new(&raw(), &with_camera(83.0), None, &Tuning::default()).unwrap();
+        assert!(d.curve.windows(2).all(|w| w[1] >= w[0]));
+        assert_eq!(d.curve[0], 0.0);
+        // 緑(ゲイン 1)が飽和した画素: リニア 1.0 は白の少し手前に来る。
+        let mut row = [100u16, 4095, 100];
+        d.apply(&mut row);
+        // 飽和画素は白へ寄せるので 3 チャンネルが揃い、かつ 16bit の上限には張り付かない。
+        assert!(row[1] > 64000 && row[1] < 65535, "{row:?}");
+        // 測ったカーブを持たない機種は、これまでどおりリニア 1.0 が上限。
+        let other = Developer::new(&raw(), &with_camera(80.0), None, &Tuning::default()).unwrap();
+        assert_eq!(other.curve_max, 1.0);
     }
 
     #[test]

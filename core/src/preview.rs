@@ -125,7 +125,7 @@ impl Loaded {
                         src_y,
                     ));
                 }
-                developer.apply(&mut line);
+                developer.apply_at(&mut line, src_y, |i| x + pos(i, width, out_w));
                 for (i, px) in line.chunks_exact(3).enumerate() {
                     for c in 0..3 {
                         sum[(i / SUBSAMPLES) * 3 + c] += px[c] as u32;

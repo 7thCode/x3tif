@@ -57,6 +57,23 @@ impl Camf {
             })
     }
 
+    /// 行列の次元と値。値の数が次元の積と合わないものは返さない。
+    pub fn matrix_with_dims(&self, name: &str) -> Option<(&[usize], &[f64])> {
+        self.0
+            .iter()
+            .find(|e| e.name == name)
+            .and_then(|e| match &e.value {
+                Value::Matrix { dims, values }
+                    if !values.is_empty()
+                        && dims.iter().try_fold(1usize, |n, &d| n.checked_mul(d))
+                            == Some(values.len()) =>
+                {
+                    Some((dims.as_slice(), values.as_slice()))
+                }
+                _ => None,
+            })
+    }
+
     /// Looks up `key` in the property list `list` (e.g. `WhiteBalanceGains` / `Sunlight`).
     pub fn property(&self, list: &str, key: &str) -> Option<&str> {
         self.0
@@ -302,6 +319,31 @@ mod tests {
         e.push(0);
         e.extend_from_slice(value);
         e
+    }
+
+    #[test]
+    fn matrix_with_dims_returns_only_consistent_matrices() {
+        let m = |name: &str, dims: Vec<usize>, n: usize| Entry {
+            name: name.into(),
+            value: Value::Matrix {
+                dims,
+                values: vec![1.0; n],
+            },
+        };
+        let c = Camf(vec![
+            m("ok", vec![2, 3], 6),
+            m("short", vec![2, 3], 5),
+            m("huge", vec![usize::MAX, 2], 4),
+            Entry {
+                name: "text".into(),
+                value: Value::Text("x".into()),
+            },
+        ]);
+        let (dims, values) = c.matrix_with_dims("ok").unwrap();
+        assert_eq!((dims, values.len()), (&[2usize, 3][..], 6));
+        for name in ["short", "huge", "text", "missing"] {
+            assert!(c.matrix_with_dims(name).is_none(), "{name}");
+        }
     }
 
     #[test]

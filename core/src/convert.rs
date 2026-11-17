@@ -3,7 +3,7 @@
 use crate::camf::{Camf, Value};
 use crate::develop::{self, Developer, Exposure, Mode};
 use crate::exif::{self, PreviewExif};
-use crate::finish::Finisher;
+use crate::finish::{self, Finisher};
 use crate::tiff::{self, Compression, Exif, Metadata};
 use crate::x3f::{Error, Properties, Raw, X3f};
 use std::io::{self, Write};
@@ -98,6 +98,13 @@ pub fn x3f_to_tiff_with_progress<W: Write>(
         Mode::Raw => None,
     };
     let shift = develop::raw_shift(&camf);
+    // 位置を使う補正(Merrill のシェーディング)のために、行の位置も渡す。
+    let origin = area.x;
+    let finish_at = |row: &mut [u16], y: usize| {
+        if let Some(d) = &developer {
+            d.apply_at(row, y, |i| origin + i);
+        }
+    };
     let finish = |row: &mut [u16]| match &developer {
         Some(d) => d.apply(row),
         None => {
@@ -126,7 +133,11 @@ pub fn x3f_to_tiff_with_progress<W: Write>(
                 tick(y);
                 let at = ((y + area.y) * width + area.x) * 3;
                 row.copy_from_slice(&rgb[at..at + area.width * 3]);
-                finish(row);
+                if developer.is_some() {
+                    finish_at(row, y + area.y);
+                } else {
+                    finish(row);
+                }
             })?;
         }
         Raw::Quattro {
@@ -182,7 +193,7 @@ pub fn x3f_to_tiff_with_progress<W: Write>(
             };
             if developer.is_some() {
                 // The developed picture is finished; the raw one stays as the sensor read it.
-                let mut finisher = Finisher::new(area.width, area.height);
+                let mut finisher = Finisher::new(area.width, area.height, finish_params(&camf));
                 tiff::write_rgb16(out, area.width, area.height, &meta, |y, row| {
                     tick(y);
                     finisher.row(y, &mut develop_row, row)
@@ -197,6 +208,16 @@ pub fn x3f_to_tiff_with_progress<W: Write>(
     }
     progress(1.0);
     Ok(())
+}
+
+/// 仕上げの強さは機種ごと: Photo Pro と比べて決めた dp0 Quattro は専用の値、それ以外の Quattro は
+/// これまでどおり sd Quattro に合わせた値。
+fn finish_params(camf: &Camf) -> finish::Params {
+    if camf.number("CAMERAID") == Some(83.0) {
+        finish::Params::DP0_QUATTRO
+    } else {
+        finish::Params::SD_QUATTRO
+    }
 }
 
 /// Median colour (0..1, sRGB-encoded) of the camera's embedded JPEG preview, if the file has a
@@ -595,6 +616,22 @@ mod tests {
                 assert!(x3f_to_tiff(data.clone(), &mut out, mode).is_err());
             }
         }
+    }
+
+    #[test]
+    fn finish_params_are_chosen_by_camera() {
+        let camera = |id: f64| {
+            Camf(vec![crate::camf::Entry {
+                name: "CAMERAID".into(),
+                value: Value::Matrix {
+                    dims: vec![1],
+                    values: vec![id],
+                },
+            }])
+        };
+        assert_eq!(finish_params(&camera(83.0)), finish::Params::DP0_QUATTRO);
+        assert_eq!(finish_params(&camera(40.0)), finish::Params::SD_QUATTRO);
+        assert_eq!(finish_params(&Camf::default()), finish::Params::SD_QUATTRO);
     }
 
     #[test]

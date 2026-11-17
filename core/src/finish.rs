@@ -43,25 +43,70 @@
 //! to 3/255 took the bokeh of 2.81 to 2.34 (Photo Pro 2.26) at the cost of the dark file's sharp
 //! response, 0.90 -> 0.77; 4/255 would be 1.98 and 0.70.
 
-const CHROMA_SIGMA: f64 = 8.5;
-const CHROMA_RADIUS: usize = 26; // 3 sigma
-/// Blur that separates the mid-frequency band (a few pixels) from the low frequencies.
-const WIDE_SIGMA: f64 = 3.5;
-const WIDE_RADIUS: usize = 11; // 3 sigma
-/// Luminance of that band below this (levels of 65535, = 6/255) is removed everywhere.
-const MID_CORE: f32 = 6.0 * 257.0;
-const SHARP_SIGMA: f64 = 0.8;
-const SHARP_RADIUS: usize = 2;
-const AMOUNT: f32 = 1.2;
-/// Encoded levels (0..65535) of the blurred luminance between which the amount fades in.
-const FADE: (f32, f32) = (0.15 * 65535.0, 0.45 * 65535.0);
-/// Luminance detail smaller than this (levels of 65535, = 3.5/255) is removed in dark and medium-dark areas, with the
-/// same fade as the sharpening turned around: 0 where the sharpening is full.
-const CORE: f32 = 3.5 * 257.0;
-/// Rows kept: the one being written and `CHROMA_RADIUS` on each side.
-const WINDOW: usize = 2 * CHROMA_RADIUS + 1;
+/// 仕上げの強さ。Photo Pro の出力に合わせて機種ごとに決める。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Params {
+    /// 色差にかけるガウスぼかしの幅(画素)。0 以下なら色差には触れない。
+    pub chroma_sigma: f64,
+    /// Blur that separates the mid-frequency band (a few pixels) from the low frequencies.
+    pub wide_sigma: f64,
+    /// Luminance of that band below this (in /255) is removed everywhere.
+    pub mid_core: f32,
+    pub sharp_sigma: f64,
+    pub amount: f32,
+    /// Encoded levels (0..1) of the blurred luminance between which the amount fades in.
+    pub fade: (f32, f32),
+    /// Luminance detail smaller than this (in /255) is removed in dark and medium-dark areas,
+    /// with the same fade as the sharpening turned around: 0 where the sharpening is full.
+    pub core: f32,
+}
+
+impl Params {
+    /// sd Quattro(CAMERAID 40)と、測っていないほかの Quattro。Photo Pro 6.9.0 の既定設定の TIFF 5 枚
+    /// (ISO 100)との RMSE(/255)で決めた。このファイル冒頭の測定で決めた以前の値(色差 σ8.5、
+    /// 中域の除去 6/255、鮮鋭化 σ0.8・量 1.2、細部の除去 3.5/255)は 12.02/6.17/5.90/5.36/9.23。
+    /// 色差のぼかしを σ2 に弱め、中域の除去をやめ、鮮鋭化を σ1.2・量 1.2(0.1〜0.4 で立ち上げ)、
+    /// 細部の除去を 2/255 にすると 9.25/5.05/5.20/4.94/6.00 で 5 枚とも下がる。dp0 Quattro の値
+    /// そのままだと 9.10/5.45/5.42/5.56/6.05 で平坦部の一致が落ち、色差 σ4・中域 3/255 では
+    /// 10.96/5.50/5.49/4.87/8.00。以前の値は粒状感を Photo Pro より強く消していた。
+    pub const SD_QUATTRO: Params = Params {
+        chroma_sigma: 2.0,
+        wide_sigma: 3.5,
+        mid_core: 0.0,
+        sharp_sigma: 1.2,
+        amount: 1.2,
+        fade: (0.1, 0.4),
+        core: 2.0,
+    };
+
+    /// dp0 Quattro(CAMERAID 83)。Photo Pro 6.9.0 の既定設定の TIFF 5 枚(ISO 100)との RMSE(/255)で
+    /// 決めた。sd Quattro の値のままだと 11.9/10.7/5.1/11.1/12.6 で、色差の高域は Photo Pro の
+    /// 1/7 しか残らず(R−G、σ3 より細かい成分が 0.24〜0.39 対 2.0〜2.9)、輝度の振幅も全帯域で
+    /// 0.70〜0.83 倍だった。ISO 100 の dp0 に粒状感の除去は要らない。除去をやめ、色差のぼかしを
+    /// σ2 に、鮮鋭化を σ1.5・量 1.0(暗部 0.05〜0.3 で立ち上げ)にすると 8.5/6.7/4.1/7.8/9.0。
+    /// 近い候補(σ0.8〜2.0、量 0.8〜1.8、色差 σ1.2〜4)は ±0.3 以内で、量 1.3 では悪化する。
+    /// 高感度のファイルは測っていない。
+    pub const DP0_QUATTRO: Params = Params {
+        chroma_sigma: 2.0,
+        wide_sigma: 3.5,
+        mid_core: 0.0,
+        sharp_sigma: 1.5,
+        amount: 1.0,
+        fade: (0.05, 0.3),
+        core: 0.0,
+    };
+}
+
+/// ガウス核の半径(3 シグマ)。
+fn radius_for(sigma: f64) -> usize {
+    (3.0 * sigma.max(0.0)).round() as usize
+}
 
 fn gaussian(sigma: f64, radius: usize) -> Vec<f32> {
+    if radius == 0 {
+        // 幅 0 はぼかさない(恒等)。
+        return vec![1.0];
+    }
     let mut k: Vec<f32> = (0..=2 * radius)
         .map(|i| {
             let d = i as f64 - radius as f64;
@@ -101,6 +146,11 @@ struct Slot {
 pub struct Finisher {
     width: usize,
     height: usize,
+    params: Params,
+    /// 色差のぼかしの半径。前後この行数だけ先読みする。
+    chroma_radius: usize,
+    wide_radius: usize,
+    sharp_radius: usize,
     wide: Vec<f32>,
     sharp: Vec<f32>,
     smooth: Vec<f32>,
@@ -113,7 +163,12 @@ pub struct Finisher {
 }
 
 impl Finisher {
-    pub fn new(width: usize, height: usize) -> Finisher {
+    pub fn new(width: usize, height: usize, params: Params) -> Finisher {
+        let chroma_radius = radius_for(params.chroma_sigma);
+        let wide_radius = radius_for(params.wide_sigma);
+        let sharp_radius = radius_for(params.sharp_sigma);
+        // 保持する行数: 書き出す行と、その前後に最も広い核の半径ぶん。
+        let window = 2 * chroma_radius.max(wide_radius).max(sharp_radius) + 1;
         let slot = || Slot {
             px: vec![0; width * 3],
             luma: vec![0.0; width],
@@ -123,10 +178,14 @@ impl Finisher {
         Finisher {
             width,
             height,
-            wide: gaussian(WIDE_SIGMA, WIDE_RADIUS),
-            sharp: gaussian(SHARP_SIGMA, SHARP_RADIUS),
-            smooth: gaussian(CHROMA_SIGMA, CHROMA_RADIUS),
-            slots: (0..WINDOW).map(|_| slot()).collect(),
+            params,
+            chroma_radius,
+            wide_radius,
+            sharp_radius,
+            wide: gaussian(params.wide_sigma, wide_radius),
+            sharp: gaussian(params.sharp_sigma, sharp_radius),
+            smooth: gaussian(params.chroma_sigma, chroma_radius),
+            slots: (0..window).map(|_| slot()).collect(),
             next: 0,
             scratch: vec![0.0; width],
             padded: Vec::new(),
@@ -135,7 +194,8 @@ impl Finisher {
     }
 
     fn develop_next(&mut self, develop: &mut impl FnMut(usize, &mut [u16])) {
-        let slot = &mut self.slots[self.next % WINDOW];
+        let window = self.slots.len();
+        let slot = &mut self.slots[self.next % window];
         develop(self.next, &mut slot.px);
         let w = self.width;
         let mut y = vec![0f32; w];
@@ -159,16 +219,23 @@ impl Finisher {
     /// fills a row of the unfinished picture and is called once per row.
     pub fn row(&mut self, y: usize, mut develop: impl FnMut(usize, &mut [u16]), out: &mut [u16]) {
         let last = self.height - 1;
-        while self.next <= (y + CHROMA_RADIUS).min(last) {
+        let window = self.slots.len();
+        let ahead = window / 2;
+        while self.next <= (y + ahead).min(last) {
             self.develop_next(&mut develop);
         }
-        let at = |d: isize| ((y as isize + d).clamp(0, last as isize) as usize) % WINDOW;
+        let at = |d: isize| ((y as isize + d).clamp(0, last as isize) as usize) % window;
+        let (chroma_radius, wide_radius, sharp_radius) =
+            (self.chroma_radius, self.wide_radius, self.sharp_radius);
+        let p = self.params;
+        let (mid_core, core) = (p.mid_core * 257.0, p.core * 257.0);
+        let fade = (p.fade.0 * 65535.0, p.fade.1 * 65535.0);
 
         // Colour differences: vertical pass of the Gaussian.
         for c in 0..3 {
             self.acc[c].fill(0.0);
             for (i, &k) in self.smooth.iter().enumerate() {
-                let row = &self.slots[at(i as isize - CHROMA_RADIUS as isize)].chroma[c];
+                let row = &self.slots[at(i as isize - chroma_radius as isize)].chroma[c];
                 for (a, v) in self.acc[c].iter_mut().zip(row) {
                     *a += k * v;
                 }
@@ -177,7 +244,7 @@ impl Finisher {
         // Luminance blurred in both directions, for the unsharp mask.
         self.scratch.fill(0.0);
         for (i, &k) in self.sharp.iter().enumerate() {
-            let row = &self.slots[at(i as isize - SHARP_RADIUS as isize)].luma;
+            let row = &self.slots[at(i as isize - sharp_radius as isize)].luma;
             for (a, v) in self.scratch.iter_mut().zip(row) {
                 *a += k * v;
             }
@@ -185,22 +252,22 @@ impl Finisher {
 
         let mut wide = vec![0f32; self.width];
         for (i, &k) in self.wide.iter().enumerate() {
-            let row = &self.slots[at(i as isize - WIDE_RADIUS as isize)].luma2;
+            let row = &self.slots[at(i as isize - wide_radius as isize)].luma2;
             for (a, v) in wide.iter_mut().zip(row) {
                 *a += k * v;
             }
         }
         let own = &self.slots[at(0)].px;
         for x in 0..self.width {
-            let p = &own[x * 3..x * 3 + 3];
-            let luma = (p[0] as f32 + p[1] as f32 + p[2] as f32) / 3.0;
+            let px = &own[x * 3..x * 3 + 3];
+            let luma = (px[0] as f32 + px[1] as f32 + px[2] as f32) / 3.0;
             let blur = self.scratch[x];
-            let t = ((blur - FADE.0) / (FADE.1 - FADE.0)).clamp(0.0, 1.0);
+            let t = ((blur - fade.0) / (fade.1 - fade.0)).clamp(0.0, 1.0);
             let d = luma - blur;
-            let d = d.signum() * (d.abs() - CORE * (1.0 - t * t * (3.0 - 2.0 * t))).max(0.0);
+            let d = d.signum() * (d.abs() - core * (1.0 - t * t * (3.0 - 2.0 * t))).max(0.0);
             let m = blur - wide[x];
-            let m = m.signum() * (m.abs() - MID_CORE).max(0.0);
-            let y_out = wide[x] + m + d * (1.0 + AMOUNT * t * t * (3.0 - 2.0 * t));
+            let m = m.signum() * (m.abs() - mid_core).max(0.0);
+            let y_out = wide[x] + m + d * (1.0 + p.amount * t * t * (3.0 - 2.0 * t));
             for c in 0..3 {
                 out[x * 3 + c] = (y_out + self.acc[c][x]).round().clamp(0.0, 65535.0) as u16;
             }
@@ -212,8 +279,20 @@ impl Finisher {
 mod tests {
     use super::*;
 
+    /// 粒状感を強く消す値(sd Quattro の以前の既定値)。色差のぼかし・中域と細部の除去という
+    /// 仕組みそのもののテストに使う。
+    const STRONG: Params = Params {
+        chroma_sigma: 8.5,
+        wide_sigma: 3.5,
+        mid_core: 6.0,
+        sharp_sigma: 0.8,
+        amount: 1.2,
+        fade: (0.15, 0.45),
+        core: 3.5,
+    };
+
     fn run(width: usize, height: usize, src: impl Fn(usize, usize) -> [u16; 3]) -> Vec<Vec<u16>> {
-        let mut s = Finisher::new(width, height);
+        let mut s = Finisher::new(width, height, STRONG);
         let mut developed = Vec::new();
         let out = (0..height)
             .map(|y| {
@@ -241,6 +320,104 @@ mod tests {
 
     fn luma(p: &[u16]) -> i32 {
         (p[0] as i32 + p[1] as i32 + p[2] as i32) / 3
+    }
+
+    fn run_with(
+        params: Params,
+        width: usize,
+        height: usize,
+        src: impl Fn(usize, usize) -> [u16; 3],
+    ) -> Vec<Vec<u16>> {
+        let mut s = Finisher::new(width, height, params);
+        (0..height)
+            .map(|y| {
+                let mut row = vec![0; width * 3];
+                s.row(
+                    y,
+                    |yy, buf| {
+                        for x in 0..width {
+                            buf[x * 3..x * 3 + 3].copy_from_slice(&src(x, yy));
+                        }
+                    },
+                    &mut row,
+                );
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn kernel_radii_follow_the_widths() {
+        // 以前の値は、定数だったころの半径(26, 11, 2)と同じになる。
+        let p = STRONG;
+        assert_eq!(
+            (
+                radius_for(p.chroma_sigma),
+                radius_for(p.wide_sigma),
+                radius_for(p.sharp_sigma)
+            ),
+            (26, 11, 2)
+        );
+        assert_eq!(radius_for(0.0), 0);
+        assert_eq!(gaussian(0.0, 0), vec![1.0]);
+        let k = gaussian(1.5, radius_for(1.5));
+        assert!((k.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zero_strength_params_return_the_picture_unchanged() {
+        let off = Params {
+            chroma_sigma: 0.0,
+            mid_core: 0.0,
+            amount: 0.0,
+            core: 0.0,
+            ..STRONG
+        };
+        let src = |x: usize, y: usize| [(x * 997 + y * 13) as u16, (y * 811) as u16, 40000];
+        let out = run_with(off, 12, 9, src);
+        for (y, row) in out.iter().enumerate() {
+            for (x, p) in row.chunks(3).enumerate() {
+                let want = src(x, y);
+                assert!(
+                    p.iter().zip(want).all(|(&a, b)| a.abs_diff(b) <= 1),
+                    "({x},{y}) {p:?} vs {want:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dp0_quattro_params_keep_fine_colour_and_dark_detail() {
+        // 色のまだら: 強い値ではほぼ消え、dp0 Quattro の値では残る。
+        let speckle = |x: usize, y: usize| {
+            if (x / 4 + y / 4).is_multiple_of(2) {
+                [33000, 27000, 30000]
+            } else {
+                [27000, 33000, 30000]
+            }
+        };
+        let spread = |p: Params| {
+            let out = run_with(p, 64, 64, speckle);
+            let c = &out[30][30 * 3..30 * 3 + 3];
+            c[0].abs_diff(c[1])
+        };
+        assert!(spread(Params::DP0_QUATTRO) > 4 * spread(STRONG));
+        // 暗部の細かい明暗も消さない。
+        let grain = |p: Params| {
+            let out = run_with(p, 48, 48, |x, y| {
+                [if (x + y).is_multiple_of(2) {
+                    8300
+                } else {
+                    7700
+                }; 3]
+            });
+            (out[24][24 * 3] as i32 - 8000).abs()
+        };
+        assert!(grain(STRONG) < 100);
+        assert!(grain(Params::DP0_QUATTRO) >= 300);
+        // sd Quattro の値はその間: 色のまだらは残し、暗部のごく細かい粒は少し抑える。
+        assert!(spread(Params::SD_QUATTRO) > 4 * spread(STRONG));
+        assert!(grain(Params::SD_QUATTRO) < grain(Params::DP0_QUATTRO));
     }
 
     #[test]
