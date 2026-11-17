@@ -89,6 +89,13 @@
         <label for="wb">WB</label>
         <select id="wb"></select>
       </div>
+      <div class="row wb" title="保存する TIFF の色空間(ICC プロファイルを埋め込みます)。プレビューは常に sRGB で表示します">
+        <label for="cs">色空間</label>
+        <select id="cs">
+          <option value="sRGB">sRGB</option>
+          <option value="AdobeRGB">Adobe RGB</option>
+        </select>
+      </div>
       <div class="row">
         <label for="ev">露出</label>
         <input type="range" id="ev" min="-4" max="4" step="0.1" value="0" disabled>
@@ -136,7 +143,7 @@
   for (const [v, label] of WB) $('wb').add(new Option(label, v));
 
   // The calibrated values: what "標準に戻す" returns to, and what a missing settings file means.
-  const STANDARD = { white_balance: null, red: 1, blue: 1, tone: 0.5 };
+  const STANDARD = { color_space: 'sRGB', white_balance: null, red: 1, blue: 1, tone: 0.5 };
   const sliders = ['red', 'blue', 'tone'];
 
   const files = [];          // { path, name, state, cls }
@@ -151,6 +158,7 @@
 
   function settings() {
     return {
+      color_space: $('cs').value,
       white_balance: $('wb').value || null,
       red: Number($('red').value),
       blue: Number($('blue').value),
@@ -160,6 +168,8 @@
   function apply(s) {
     $('wb').value = s.white_balance || '';
     if ($('wb').value !== (s.white_balance || '')) $('wb').value = '';
+    $('cs').value = s.color_space || 'sRGB';
+    if (!$('cs').value) $('cs').value = 'sRGB';
     for (const k of sliders) { $(k).value = s[k]; $(k + '-out').textContent = fmt(s[k]); }
   }
   const exposure = () => ($('auto').checked ? null : Number($('ev').value));

@@ -36,6 +36,8 @@ pub const GAIN_RANGE: (f64, f64) = (0.5, 2.0);
 /// Adjustments on top of the calibrated defaults. `Tuning::default()` changes nothing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tuning {
+    /// 出力の色空間。
+    pub color_space: ColorSpace,
     /// Use this white balance instead of the one the file was shot with.
     pub white_balance: Option<&'static str>,
     /// Multipliers on the red and blue gains (1.0 = as calibrated).
@@ -48,6 +50,7 @@ pub struct Tuning {
 impl Default for Tuning {
     fn default() -> Self {
         Tuning {
+            color_space: ColorSpace::default(),
             white_balance: None,
             red: 1.0,
             blue: 1.0,
@@ -69,11 +72,75 @@ impl Tuning {
             }
         };
         Tuning {
+            color_space: self.color_space,
             white_balance: self.white_balance,
             red: pick(self.red, GAIN_RANGE.0, GAIN_RANGE.1, d.red),
             blue: pick(self.blue, GAIN_RANGE.0, GAIN_RANGE.1, d.blue),
             tone: pick(self.tone, 0.0, 1.0, d.tone),
         }
+    }
+}
+
+/// 「見たまま」出力の色空間。Photo Pro は撮影時の設定に従うが、Quattro の X3F にはその設定を
+/// 確実に読める場所がないので、こちらは利用者が選ぶ。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColorSpace {
+    #[default]
+    Srgb,
+    /// Adobe RGB (1998) 互換(原色とガンマ 563/256)。
+    AdobeRgb,
+}
+
+/// リニア sRGB → リニア Adobe RGB (1998)(どちらも D65)。
+const SRGB_TO_ADOBE: [[f64; 3]; 3] = [
+    [0.715_127_6, 0.284_872_4, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.041_161_9, 0.958_838_1],
+];
+/// その逆のうち、赤の行(リニア Adobe RGB → リニア sRGB の赤)。
+const ADOBE_TO_SRGB_RED: [f64; 3] = [1.398_350_8, -0.398_350_8, 0.0];
+const ADOBE_GAMMA: f64 = 563.0 / 256.0;
+
+impl ColorSpace {
+    /// 設定ファイルと XMP に書く名前。
+    pub fn name(self) -> &'static str {
+        match self {
+            ColorSpace::Srgb => "sRGB",
+            ColorSpace::AdobeRgb => "AdobeRGB",
+        }
+    }
+
+    /// `name` の逆。知らない名前は `None`。
+    pub fn from_name(name: &str) -> Option<ColorSpace> {
+        [ColorSpace::Srgb, ColorSpace::AdobeRgb]
+            .into_iter()
+            .find(|c| c.name() == name)
+    }
+
+    /// リニア値(0..=1)をこの色空間のエンコード値にする。
+    fn encode(self, l: f64) -> f64 {
+        match self {
+            ColorSpace::Srgb => srgb_encode(l),
+            ColorSpace::AdobeRgb => l.max(0.0).powf(1.0 / ADOBE_GAMMA),
+        }
+    }
+
+    /// 16bit のエンコード値すべてに対するリニア値。
+    fn decoding(self) -> Vec<f32> {
+        match self {
+            ColorSpace::Srgb => srgb_decoding(),
+            ColorSpace::AdobeRgb => (0..=u16::MAX)
+                .map(|v| (v as f64 / 65535.0).powf(ADOBE_GAMMA) as f32)
+                .collect(),
+        }
+    }
+}
+
+fn srgb_decode(e: f64) -> f64 {
+    if e <= 0.04045 {
+        e / 12.92
+    } else {
+        ((e + 0.055) / 1.055).powf(2.4)
     }
 }
 
@@ -282,15 +349,16 @@ pub struct Developer {
     white: [f64; 3],
     /// raw-normalised RGB -> linear sRGB, with white balance gains and ISO scaling folded in.
     matrix: [[f64; 3]; 3],
-    /// sRGB-encoded 16 bit value for evenly spaced linear inputs in 0..=`curve_max`.
+    /// Encoded 16 bit value (in `color_space`) for evenly spaced linear inputs in 0..=`curve_max`.
     curve: Vec<f64>,
     /// カーブが受け取るリニア値の上限(測ったカーブを持つ機種は 1 を超えることがある)。
     curve_max: f64,
     /// Per-channel linear gain applied before the curve (2^EV).
     gain: [f64; 3],
     tone: f64,
-    /// Red-row correction applied to the finished picture, with the sRGB decoding it needs.
+    /// Red-row correction applied to the finished picture, with the decoding it needs.
     red_row: Option<([f64; 3], Vec<f32>)>,
+    color_space: ColorSpace,
     /// 場所ごとのゲイン(Merrill のシェーディング補正)。
     shading: Option<Shading>,
     /// Exposure that `Exposure::Auto` stands for, when it does not depend on the picture.
@@ -738,6 +806,13 @@ impl Developer {
                     Some(m) => m.encode(l, tuning.tone),
                     None => encode_with(l, tuning.tone),
                 };
+                // 表とカーブは sRGB エンコードで持っている。ほかの色空間では同じリニア値を
+                // その色空間のガンマでエンコードし直す(Photo Pro のカーブは出力色空間の
+                // チャンネルごとに掛かっている)。
+                let e = match tuning.color_space {
+                    ColorSpace::Srgb => e,
+                    other => other.encode(srgb_decode(e.clamp(0.0, 1.0))),
+                };
                 e * 65535.0
             })
             .collect();
@@ -753,7 +828,8 @@ impl Developer {
             curve_max,
             gain: [1.0; 3],
             tone: tuning.tone,
-            red_row: sd_quattro.then(|| (SD_QUATTRO_RED_ROW, srgb_decoding())),
+            red_row: sd_quattro.then(|| (SD_QUATTRO_RED_ROW, tuning.color_space.decoding())),
+            color_space: tuning.color_space,
             shading: Shading::new(raw, camf),
             fixed_exposure: measured.map(|m| m.exposure_ev),
             white_balance: name,
@@ -763,6 +839,11 @@ impl Developer {
     /// The exposure that "auto" means for this camera when it does not depend on the picture.
     pub fn fixed_exposure(&self) -> Option<f64> {
         self.fixed_exposure
+    }
+
+    /// 出力の色空間。
+    pub fn color_space(&self) -> ColorSpace {
+        self.color_space
     }
 
     /// The tone curve strength this developer was built with.
@@ -863,11 +944,18 @@ impl Developer {
                 ((px[c] as f64 - self.black[c]) / (self.white[c] - self.black[c])).max(0.0)
             });
             let n: [f64; 3] = std::array::from_fn(|c| raw[c] * shade[c]);
-            let mut lin: [f64; 3] = std::array::from_fn(|c| {
+            let srgb: [f64; 3] = std::array::from_fn(|c| {
                 let m = &self.matrix[c];
-                ((m[0] * n[0] + m[1] * n[1] + m[2] * n[2]) * self.gain[c])
-                    .clamp(0.0, self.curve_max)
+                (m[0] * n[0] + m[1] * n[1] + m[2] * n[2]) * self.gain[c]
             });
+            // 色空間の変換はクランプの前。sRGB の外の色(負の成分)が Adobe RGB では残る。
+            let mut lin = match self.color_space {
+                ColorSpace::Srgb => srgb,
+                ColorSpace::AdobeRgb => {
+                    SRGB_TO_ADOBE.map(|m| m[0] * srgb[0] + m[1] * srgb[1] + m[2] * srgb[2])
+                }
+            }
+            .map(|l| l.clamp(0.0, self.curve_max));
             // A saturated channel under-reports its colour, which turns bright skies yellow-green.
             // Blend those pixels towards white as the brightest channel nears saturation.
             let peak = raw.iter().cloned().fold(0.0, f64::max);
@@ -885,8 +973,27 @@ impl Developer {
                 *out = (self.curve[i] * (1.0 - f) + self.curve[i + 1] * f).round() as u16;
             }
             if let Some((row, decode)) = &self.red_row {
-                let l: f64 = (0..3).map(|k| row[k] * decode[px[k] as usize] as f64).sum();
-                px[0] = (srgb_encode(l.clamp(0.0, 1.0)) * 65535.0).round() as u16;
+                let l: [f64; 3] = std::array::from_fn(|k| decode[px[k] as usize] as f64);
+                match self.color_space {
+                    ColorSpace::Srgb => {
+                        let r: f64 = (0..3).map(|k| row[k] * l[k]).sum();
+                        px[0] = (srgb_encode(r.clamp(0.0, 1.0)) * 65535.0).round() as u16;
+                    }
+                    space => {
+                        // 補正は sRGB の赤に対するもの。Adobe RGB の緑は sRGB の緑と同じで、
+                        // 青は sRGB の赤を含まないので、変わるのは Adobe RGB の赤だけ。
+                        let a = &ADOBE_TO_SRGB_RED;
+                        let (g, b) = (SRGB_TO_ADOBE[2][1], SRGB_TO_ADOBE[2][2]);
+                        let s = [
+                            a[0] * l[0] + a[1] * l[1] + a[2] * l[2],
+                            l[1],
+                            (l[2] - g * l[1]) / b,
+                        ];
+                        let r: f64 = (0..3).map(|k| row[k] * s[k]).sum();
+                        let out = l[0] + SRGB_TO_ADOBE[0][0] * (r - s[0]);
+                        px[0] = (space.encode(out.clamp(0.0, 1.0)) * 65535.0).round() as u16;
+                    }
+                }
             }
         }
     }
@@ -1258,12 +1365,14 @@ mod tests {
     #[test]
     fn out_of_range_tuning_falls_back_to_the_defaults() {
         let bad = Tuning {
+            color_space: ColorSpace::AdobeRgb,
             white_balance: Some("Sunlight"),
             red: f64::NAN,
             blue: 99.0,
             tone: -1.0,
         };
         let s = bad.sanitized();
+        assert_eq!(s.color_space, ColorSpace::AdobeRgb);
         assert_eq!((s.red, s.blue, s.tone), (1.0, 1.0, TONE_STRENGTH));
         assert_eq!(s.white_balance, Some("Sunlight"));
         let edge = Tuning {
@@ -1705,6 +1814,18 @@ mod tests {
         assert_eq!(d.curve_max, 2.0);
     }
 
+    fn developed_in(space: ColorSpace, camera: f64, px: [u16; 3]) -> [u16; 3] {
+        let tuning = Tuning {
+            color_space: space,
+            ..Tuning::default()
+        };
+        let d = Developer::new(&raw(), &with_camera(camera), None, &tuning).unwrap();
+        assert_eq!(d.color_space(), space);
+        let mut row = px;
+        d.apply(&mut row);
+        row
+    }
+
     /// 2x3 の補正表を持つ Merrill の CAMF(絞り 2.8 と 8 の 2 段)。
     fn shaded_camf(aperture: f64) -> Camf {
         let table = |name: &str, values: &[f64]| Entry {
@@ -1840,6 +1961,73 @@ mod tests {
         d.apply(&mut a);
         d.apply_at(&mut b, 0, |_| 0);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn color_space_names_round_trip_and_unknown_names_are_rejected() {
+        for space in [ColorSpace::Srgb, ColorSpace::AdobeRgb] {
+            assert_eq!(ColorSpace::from_name(space.name()), Some(space));
+        }
+        assert_eq!(ColorSpace::from_name("ProPhoto"), None);
+        assert_eq!(ColorSpace::from_name(""), None);
+        assert_eq!(Tuning::default().color_space, ColorSpace::Srgb);
+    }
+
+    #[test]
+    fn adobe_rgb_output_is_the_same_colour_as_the_srgb_output() {
+        // sRGB の色域に収まる色は、どちらの色空間で書いても同じ色(リニア光)を指す。
+        // 78 は測ったカーブも赤の補正も持たない機種。
+        for px in [[400, 500, 600], [900, 700, 300], [1500, 1500, 1500]] {
+            let s = developed_in(ColorSpace::Srgb, 78.0, px).map(|v| v as f64 / 65535.0);
+            let a = developed_in(ColorSpace::AdobeRgb, 78.0, px).map(|v| v as f64 / 65535.0);
+            let tone = |e: f64| e + TONE_STRENGTH * (e * e * (3.0 - 2.0 * e) - e);
+            // カーブを通る前のリニア値に戻して比べる(カーブは出力色空間のチャンネルごと)。
+            let untone = |y: f64| {
+                let (mut lo, mut hi) = (0.0, 1.0);
+                for _ in 0..50 {
+                    let mid = (lo + hi) / 2.0;
+                    if tone(mid) < y {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                srgb_decode((lo + hi) / 2.0)
+            };
+            let s_lin = s.map(untone);
+            let a_lin = a.map(|e| untone(srgb_encode(e.powf(ADOBE_GAMMA))));
+            let want = SRGB_TO_ADOBE.map(|m| m[0] * s_lin[0] + m[1] * s_lin[1] + m[2] * s_lin[2]);
+            for c in 0..3 {
+                assert!(
+                    (a_lin[c] - want[c]).abs() < 2e-3,
+                    "{px:?} {c}: {a_lin:?} {want:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adobe_rgb_keeps_grey_grey_and_white_white() {
+        for camera in [40.0, 77.0, 78.0, 83.0] {
+            let grey = developed_in(ColorSpace::AdobeRgb, camera, [1000, 1000, 1000]);
+            let srgb = developed_in(ColorSpace::Srgb, camera, [1000, 1000, 1000]);
+            // sRGB で灰色になる入力は Adobe RGB でも灰色(白色点が同じ)。機種の補正で色が付く入力は
+            // 原色が広いぶん、エンコード値の開きが小さくなる。
+            let spread = |p: [u16; 3]| p.iter().max().unwrap() - p.iter().min().unwrap();
+            if spread(srgb) < 200 {
+                assert!(spread(grey) < 300, "camera {camera}: {grey:?} {srgb:?}");
+            } else {
+                assert!(
+                    spread(grey) < spread(srgb),
+                    "camera {camera}: {grey:?} {srgb:?}"
+                );
+            }
+            let white = developed_in(ColorSpace::AdobeRgb, camera, [u16::MAX; 3]);
+            assert!(
+                white.iter().all(|&v| v > 60000),
+                "camera {camera}: {white:?}"
+            );
+        }
     }
 
     #[test]

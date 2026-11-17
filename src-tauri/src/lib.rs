@@ -8,7 +8,7 @@ use std::{
     time::SystemTime,
 };
 use tauri::{Emitter, Manager};
-use x3tif_core::develop::{white_balance_name, Exposure, Mode, Tuning};
+use x3tif_core::develop::{white_balance_name, ColorSpace, Exposure, Mode, Tuning};
 use x3tif_core::preview::Loaded;
 
 /// The saved defaults for the developed output (`settings.json` in the app config folder).
@@ -16,6 +16,8 @@ use x3tif_core::preview::Loaded;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 struct Settings {
+    /// 保存する TIFF の色空間(`ColorSpace::name`)。知らない名前は sRGB に戻す。
+    color_space: String,
     /// `None` keeps the white balance the file was shot with.
     white_balance: Option<String>,
     red: f64,
@@ -27,6 +29,7 @@ impl Default for Settings {
     fn default() -> Self {
         let t = Tuning::default();
         Settings {
+            color_space: t.color_space.name().to_owned(),
             white_balance: None,
             red: t.red,
             blue: t.blue,
@@ -38,6 +41,7 @@ impl Default for Settings {
 impl Settings {
     fn tuning(&self) -> Tuning {
         Tuning {
+            color_space: ColorSpace::from_name(&self.color_space).unwrap_or_default(),
             white_balance: self.white_balance.as_deref().and_then(white_balance_name),
             red: self.red,
             blue: self.blue,
@@ -50,6 +54,7 @@ impl Settings {
     fn normalized(&self) -> Settings {
         let t = self.tuning();
         Settings {
+            color_space: t.color_space.name().to_owned(),
             white_balance: t.white_balance.map(str::to_owned),
             red: t.red,
             blue: t.blue,
@@ -319,6 +324,7 @@ mod tests {
         assert_eq!(Settings::default().tuning(), Tuning::default());
 
         let s = Settings {
+            color_space: "AdobeRGB".into(),
             white_balance: Some("Overcast".into()),
             red: 1.1,
             blue: 0.9,
@@ -347,6 +353,16 @@ mod tests {
         fs::write(&path, br#"{"red":1.2,"tone":2.0}"#).unwrap();
         let s = load_settings(&path);
         assert_eq!((s.red, s.blue, s.tone), (1.2, 1.0, Tuning::default().tone));
+        // 色空間: 既知の名前は残り、知らない名前や型違いは sRGB に戻る。
+        fs::write(&path, br#"{"color_space":"AdobeRGB"}"#).unwrap();
+        assert_eq!(
+            load_settings(&path).tuning().color_space,
+            ColorSpace::AdobeRgb
+        );
+        fs::write(&path, br#"{"color_space":"../../etc"}"#).unwrap();
+        assert_eq!(load_settings(&path), Settings::default());
+        fs::write(&path, br#"{"color_space":7}"#).unwrap();
+        assert_eq!(load_settings(&path), Settings::default());
 
         let saved = store_settings(
             &path,

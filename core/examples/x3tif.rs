@@ -1,7 +1,7 @@
-//! CLI harness: x3tif <in.x3f> <out.tif> [raw|developed [ev]]
+//! CLI harness: x3tif <in.x3f> <out.tif> [raw|developed [ev|auto [srgb|adobe]]]
 //!              x3tif <in.x3f> <out.png> preview [ev [max_side]]
 use std::{env, fs, io::BufWriter, process::ExitCode};
-use x3tif_core::develop::{Exposure, Mode, Tuning};
+use x3tif_core::develop::{ColorSpace, Exposure, Mode, Tuning};
 
 /// 入力を読む。X3F としてあり得ない大きさのファイルは、メモリに載せる前に断る。
 fn read_input(path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -14,7 +14,7 @@ fn read_input(path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if !(3..=6).contains(&args.len()) {
-        eprintln!("usage: x3tif <in.x3f> <out.tif> [raw|developed [ev]]");
+        eprintln!("usage: x3tif <in.x3f> <out.tif> [raw|developed [ev|auto [srgb|adobe]]]");
         eprintln!("       x3tif <in.x3f> <out.png> preview [ev [max_side]]");
         return ExitCode::from(2);
     }
@@ -54,7 +54,17 @@ fn main() -> ExitCode {
                 Some(ev) => Exposure::Ev(ev),
                 None => Exposure::Auto,
             },
-            Tuning::default(),
+            Tuning {
+                color_space: match args.get(5).map(String::as_str) {
+                    None | Some("srgb") => ColorSpace::Srgb,
+                    Some("adobe") => ColorSpace::AdobeRgb,
+                    Some(other) => {
+                        eprintln!("unknown colour space: {other}");
+                        return ExitCode::from(2);
+                    }
+                },
+                ..Tuning::default()
+            },
         ),
         Some(other) => {
             eprintln!("unknown mode: {other}");

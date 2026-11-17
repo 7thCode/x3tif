@@ -1,7 +1,7 @@
 //! X3F → 16 bit TIFF conversion, either as raw sensor values or developed to sRGB.
 
 use crate::camf::{Camf, Value};
-use crate::develop::{self, Developer, Exposure, Mode};
+use crate::develop::{self, ColorSpace, Developer, Exposure, Mode};
 use crate::exif::{self, PreviewExif};
 use crate::finish::{self, Finisher};
 use crate::tiff::{self, Compression, Exif, Metadata};
@@ -117,7 +117,7 @@ pub fn x3f_to_tiff_with_progress<W: Write>(
     };
 
     let output = match (&developer, shift) {
-        (Some(d), _) => Output::Developed(d.white_balance.clone(), ev),
+        (Some(d), _) => Output::Developed(d.white_balance.clone(), ev, d.color_space()),
         (None, s) => Output::Raw(1 << s),
     };
     let meta = metadata(&props, &camf, &preview, &output);
@@ -299,8 +299,8 @@ pub(crate) fn active_area(camf: &Camf, width: usize, height: usize) -> Area {
 enum Output {
     /// Raw sensor values multiplied by this factor.
     Raw(u32),
-    /// Developed with the named white balance.
-    Developed(String, [f64; 3]),
+    /// Developed with the named white balance and exposure, in this colour space.
+    Developed(String, [f64; 3], ColorSpace),
 }
 
 /// For each full-resolution coordinate, the two neighbouring low-resolution samples and the
@@ -418,8 +418,13 @@ fn metadata(props: &Properties, camf: &Camf, preview: &PreviewExif, output: &Out
         compression: Compression::Deflate,
         exif: exif(props, camf, preview),
         xmp: Some(xmp(props, camf, output)),
-        // Only the developed picture is sRGB; raw values are the sensor's own and stay untagged.
-        icc_profile: matches!(output, Output::Developed(..)).then(crate::icc::srgb),
+        // Only the developed picture has a colour space; raw values are the sensor's own and
+        // stay untagged.
+        icc_profile: match output {
+            Output::Developed(_, _, ColorSpace::Srgb) => Some(crate::icc::srgb()),
+            Output::Developed(_, _, ColorSpace::AdobeRgb) => Some(crate::icc::adobe_rgb()),
+            Output::Raw(_) => None,
+        },
     }
 }
 
@@ -453,8 +458,9 @@ fn xmp(props: &Properties, camf: &Camf, output: &Output) -> Vec<u8> {
     let how = match output {
         // Divide the samples by RawScale to get the sensor's own values back.
         Output::Raw(scale) => format!("x3f:OutputMode=\"raw\" x3f:RawScale=\"{scale}\""),
-        Output::Developed(wb, ev) => format!(
-            "x3f:OutputMode=\"developed\" x3f:ColorSpace=\"sRGB\" x3f:WhiteBalance=\"{}\" x3f:ExposureEV=\"{:.2},{:.2},{:.2}\"",
+        Output::Developed(wb, ev, space) => format!(
+            "x3f:OutputMode=\"developed\" x3f:ColorSpace=\"{}\" x3f:WhiteBalance=\"{}\" x3f:ExposureEV=\"{:.2},{:.2},{:.2}\"",
+            space.name(),
             xml_escape(wb),
             ev[0],
             ev[1],
