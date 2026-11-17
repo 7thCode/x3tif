@@ -41,9 +41,9 @@ Quattro 世代は、上層がフル解像度で、中層・下層は縦横 1/2 �
 [Releases](https://github.com/7thCode/x3tif/releases) からインストーラをダウンロードして起動し、
 X3F ファイルをウィンドウにドロップします(複数可)。右の一覧からファイルを選ぶと、縮小したプレビューが出ます。
 
-- **見たまま**: WB、色空間(sRGB / Adobe RGB)、露出(自動または手動)、赤・青の強さ、トーンを調整できます。Photo Pro は撮影時の色空間の設定に従うので、Photo Pro の出力と揃えたいときは撮影時と同じ色空間を選びます(Quattro の X3F からは撮影時の設定を確実に読めないため、自動では選びません)。プレビューは常に sRGB で表示します。プレビューは表示用に縮小した画像で、ピントや粒状感の確認には使えません。「保存」で選んだファイル、「すべて保存」で一覧の全ファイルを、いまの調整で書き出します。
+- **見たまま**: WB、色空間(sRGB / Adobe RGB)、露出(自動または手動)、赤・青の強さ、トーン、粒状感(Quattro)を調整できます。粒状感は 0 が Photo Pro に合わせた機種ごとの値で、上げるほど粒状感と色ノイズを強く消します(1 で以前の強い除去。sd Quattro の参照 5 枚で、Photo Pro との RMSE の平均は 0 で 6.09、0.5 で 6.70、1 で 7.74)。保存する TIFF にだけ効き、プレビューは変わりません。Photo Pro は撮影時の色空間の設定に従うので、Photo Pro の出力と揃えたいときは撮影時と同じ色空間を選びます(Quattro の X3F からは撮影時の設定を確実に読めないため、自動では選びません)。プレビューは常に sRGB で表示します。プレビューは表示用に縮小した画像で、ピントや粒状感の確認には使えません。「保存」で選んだファイル、「すべて保存」で一覧の全ファイルを、いまの調整で書き出します。
 - **生データ**: 調整は適用せず、センサーの値のまま書き出します。
-- 「既定値として保存」で、WB・色空間・赤・青・トーンの調整を次回以降の初期値にします(保存先はアプリの設定フォルダの `settings.json`)。「標準に戻す」で、較正済みの初期値に戻ります。露出はファイルごとの値なので、既定値には含まれません。
+- 「既定値として保存」で、WB・色空間・赤・青・トーン・粒状感の調整を次回以降の初期値にします(保存先はアプリの設定フォルダの `settings.json`)。「標準に戻す」で、較正済みの初期値に戻ります。露出はファイルごとの値なので、既定値には含まれません。
 - 既存の `.tif` は上書きせず、`-1`, `-2`… を付けて保存します。
 
 ## ビルド
@@ -66,6 +66,7 @@ cargo fmt --all --check
 # X3F → TIFF(生データ / 見たまま [露出 EV])、または縮小プレビューの PNG
 cargo run --release -p x3tif-core --example x3tif -- in.x3f out.tif developed
 cargo run --release -p x3tif-core --example x3tif -- in.x3f out.tif developed auto adobe   # Adobe RGB で書き出す(ev は数値か auto)
+cargo run --release -p x3tif-core --example x3tif -- in.x3f out.tif developed auto srgb 0.5   # 粒状感の抑制 0〜1(Quattro)
 cargo run --release -p x3tif-core --example x3tif -- in.x3f out.png preview
 # 2 つの 16bit TIFF を画素単位で比べる(下の「検証」)
 cargo run --release -p x3tif-core --example tiffcmp -- photopro.tif x3tif.tif
@@ -143,7 +144,7 @@ DP1 Merrill 26.5〜30.8 dB、sd Quattro 29.3〜34.8 dB。)
 機種ごとに合わせた内容:
 
 - **dp0 Quattro**: 露出を 0 EV に固定し、トーンカーブを Photo Pro から測った表に。仕上げは粒状感の除去をやめ、色のぼかしを弱く。
-  色温度指定 WB の青のゲインを 1.17 → 1.147。
+  色温度指定 WB の青のゲインを 1.17 → 1.147(dp1〜dp3 Quattro も同じ値。sd Quattro などほかの Quattro は 1.17 のまま)。
 - **DP1 Merrill**: 露出を 0 EV に固定し、トーンカーブを測った表に。CAMF の表を使ったシェーディング補正(周辺の光量落ちと
   色かぶり)を追加。換算式は CAMF に無いので Photo Pro の出力から求めたもので、灰色に近い部分の色の比のずれの場所による
   ばらつきは、青/緑 0.144 → 0.029 段、赤/緑 0.095 → 0.037 段になりました。赤のゲインの補正は 1.04 → 1.024。

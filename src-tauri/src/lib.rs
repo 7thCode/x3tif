@@ -23,6 +23,8 @@ struct Settings {
     red: f64,
     blue: f64,
     tone: f64,
+    /// Quattro の粒状感の抑制(0〜1)。
+    grain: f64,
 }
 
 impl Default for Settings {
@@ -34,6 +36,7 @@ impl Default for Settings {
             red: t.red,
             blue: t.blue,
             tone: t.tone,
+            grain: t.grain,
         }
     }
 }
@@ -46,6 +49,7 @@ impl Settings {
             red: self.red,
             blue: self.blue,
             tone: self.tone,
+            grain: self.grain,
         }
         .sanitized()
     }
@@ -59,6 +63,7 @@ impl Settings {
             red: t.red,
             blue: t.blue,
             tone: t.tone,
+            grain: t.grain,
         }
     }
 }
@@ -329,6 +334,7 @@ mod tests {
             red: 1.1,
             blue: 0.9,
             tone: 0.25,
+            grain: 0.75,
         };
         assert_eq!(store_settings(&path, &s).unwrap(), s);
         assert_eq!(load_settings(&path), s);
@@ -350,6 +356,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_settings(&path), Settings::default());
+        // 粒状感の抑制: 範囲内は残り、範囲外・型違いは 0 に戻る。
+        fs::write(&path, br#"{"grain":0.4}"#).unwrap();
+        assert_eq!(load_settings(&path).tuning().grain, 0.4);
+        for bad in [
+            &br#"{"grain":5}"#[..],
+            br#"{"grain":-1}"#,
+            br#"{"grain":"x"}"#,
+        ] {
+            fs::write(&path, bad).unwrap();
+            assert_eq!(load_settings(&path), Settings::default());
+        }
         fs::write(&path, br#"{"red":1.2,"tone":2.0}"#).unwrap();
         let s = load_settings(&path);
         assert_eq!((s.red, s.blue, s.tone), (1.2, 1.0, Tuning::default().tone));

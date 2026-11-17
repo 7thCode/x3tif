@@ -79,6 +79,40 @@ impl Params {
         core: 2.0,
     };
 
+    /// 粒状感を強く消す値。sd Quattro の以前の既定値(Photo Pro 6.9.0 の TIFF との RMSE は
+    /// 12.02/6.17/5.90/5.36/9.23 で、`SD_QUATTRO` より 5 枚とも大きい)で、利用者が粒状感の
+    /// 抑制(`Tuning::grain`)を上げたときに `blend` の行き先になる。
+    pub const SMOOTH: Params = Params {
+        chroma_sigma: 8.5,
+        wide_sigma: 3.5,
+        mid_core: 6.0,
+        sharp_sigma: 0.8,
+        amount: 1.2,
+        fade: (0.15, 0.45),
+        core: 3.5,
+    };
+
+    /// `self` から `to` へ、`t`(0 で `self`、1 で `to`。範囲の外は丸める)だけ寄せた値。
+    pub fn blend(self, to: Params, t: f64) -> Params {
+        let t = if t.is_finite() {
+            t.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let f = t as f32;
+        let mix = |a: f64, b: f64| a + (b - a) * t;
+        let mixf = |a: f32, b: f32| a + (b - a) * f;
+        Params {
+            chroma_sigma: mix(self.chroma_sigma, to.chroma_sigma),
+            wide_sigma: mix(self.wide_sigma, to.wide_sigma),
+            mid_core: mixf(self.mid_core, to.mid_core),
+            sharp_sigma: mix(self.sharp_sigma, to.sharp_sigma),
+            amount: mixf(self.amount, to.amount),
+            fade: (mixf(self.fade.0, to.fade.0), mixf(self.fade.1, to.fade.1)),
+            core: mixf(self.core, to.core),
+        }
+    }
+
     /// dp0 Quattro(CAMERAID 83。dp1〜dp3 Quattro は参照が無いまま同じ値を使う)。Photo Pro 6.9.0 の既定設定の TIFF 5 枚(ISO 100)との RMSE(/255)で
     /// 決めた。sd Quattro の値のままだと 11.9/10.7/5.1/11.1/12.6 で、色差の高域は Photo Pro の
     /// 1/7 しか残らず(R−G、σ3 より細かい成分が 0.24〜0.39 対 2.0〜2.9)、輝度の振幅も全帯域で
@@ -279,20 +313,8 @@ impl Finisher {
 mod tests {
     use super::*;
 
-    /// 粒状感を強く消す値(sd Quattro の以前の既定値)。色差のぼかし・中域と細部の除去という
-    /// 仕組みそのもののテストに使う。
-    const STRONG: Params = Params {
-        chroma_sigma: 8.5,
-        wide_sigma: 3.5,
-        mid_core: 6.0,
-        sharp_sigma: 0.8,
-        amount: 1.2,
-        fade: (0.15, 0.45),
-        core: 3.5,
-    };
-
     fn run(width: usize, height: usize, src: impl Fn(usize, usize) -> [u16; 3]) -> Vec<Vec<u16>> {
-        let mut s = Finisher::new(width, height, STRONG);
+        let mut s = Finisher::new(width, height, Params::SMOOTH);
         let mut developed = Vec::new();
         let out = (0..height)
             .map(|y| {
@@ -347,9 +369,45 @@ mod tests {
     }
 
     #[test]
+    fn blend_moves_between_the_two_parameter_sets_and_clamps() {
+        let (a, b) = (Params::SD_QUATTRO, Params::SMOOTH);
+        assert_eq!(a.blend(b, 0.0), a);
+        assert_eq!(a.blend(b, 1.0), b);
+        assert_eq!(a.blend(b, -3.0), a);
+        assert_eq!(a.blend(b, 9.0), b);
+        assert_eq!(a.blend(b, f64::NAN), a);
+        let h = a.blend(b, 0.5);
+        assert!((h.chroma_sigma - (a.chroma_sigma + b.chroma_sigma) / 2.0).abs() < 1e-12);
+        assert!((h.mid_core - (a.mid_core + b.mid_core) / 2.0).abs() < 1e-6);
+        assert!((h.fade.0 - (a.fade.0 + b.fade.0) / 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn more_grain_reduction_removes_more_of_a_fine_grain() {
+        // 暗部の細かい明暗(±3.8/255): 抑制を上げるほど平らになる(測った残り 503 → 293 → 93)。
+        let grain = |t: f64| {
+            let out = run_with(
+                Params::SD_QUATTRO.blend(Params::SMOOTH, t),
+                48,
+                48,
+                |x, y| {
+                    [if (x + y).is_multiple_of(2) {
+                        9000
+                    } else {
+                        7000
+                    }; 3]
+                },
+            );
+            (out[24][24 * 3] as i32 - 8000).abs()
+        };
+        assert!(grain(0.0) > grain(0.5) && grain(0.5) > grain(1.0));
+        assert!(grain(1.0) < 150);
+    }
+
+    #[test]
     fn kernel_radii_follow_the_widths() {
         // 以前の値は、定数だったころの半径(26, 11, 2)と同じになる。
-        let p = STRONG;
+        let p = Params::SMOOTH;
         assert_eq!(
             (
                 radius_for(p.chroma_sigma),
@@ -371,7 +429,7 @@ mod tests {
             mid_core: 0.0,
             amount: 0.0,
             core: 0.0,
-            ..STRONG
+            ..Params::SMOOTH
         };
         let src = |x: usize, y: usize| [(x * 997 + y * 13) as u16, (y * 811) as u16, 40000];
         let out = run_with(off, 12, 9, src);
@@ -401,7 +459,7 @@ mod tests {
             let c = &out[30][30 * 3..30 * 3 + 3];
             c[0].abs_diff(c[1])
         };
-        assert!(spread(Params::DP0_QUATTRO) > 4 * spread(STRONG));
+        assert!(spread(Params::DP0_QUATTRO) > 4 * spread(Params::SMOOTH));
         // 暗部の細かい明暗も消さない。
         let grain = |p: Params| {
             let out = run_with(p, 48, 48, |x, y| {
@@ -413,10 +471,10 @@ mod tests {
             });
             (out[24][24 * 3] as i32 - 8000).abs()
         };
-        assert!(grain(STRONG) < 100);
+        assert!(grain(Params::SMOOTH) < 100);
         assert!(grain(Params::DP0_QUATTRO) >= 300);
         // sd Quattro の値はその間: 色のまだらは残し、暗部のごく細かい粒は少し抑える。
-        assert!(spread(Params::SD_QUATTRO) > 4 * spread(STRONG));
+        assert!(spread(Params::SD_QUATTRO) > 4 * spread(Params::SMOOTH));
         assert!(grain(Params::SD_QUATTRO) < grain(Params::DP0_QUATTRO));
     }
 

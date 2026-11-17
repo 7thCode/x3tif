@@ -45,6 +45,9 @@ pub struct Tuning {
     pub blue: f64,
     /// How far the S-shaped tone curve is mixed in, 0 (plain sRGB) to 1.
     pub tone: f64,
+    /// Quattro の粒状感・色ノイズの抑制の強さ。0 は Photo Pro に合わせた機種ごとの値、
+    /// 1 は強く消す値(`finish::Params::SMOOTH`)。保存する TIFF にだけ効き、プレビューは変わらない。
+    pub grain: f64,
 }
 
 impl Default for Tuning {
@@ -55,6 +58,7 @@ impl Default for Tuning {
             red: 1.0,
             blue: 1.0,
             tone: TONE_STRENGTH,
+            grain: 0.0,
         }
     }
 }
@@ -77,6 +81,7 @@ impl Tuning {
             red: pick(self.red, GAIN_RANGE.0, GAIN_RANGE.1, d.red),
             blue: pick(self.blue, GAIN_RANGE.0, GAIN_RANGE.1, d.blue),
             tone: pick(self.tone, 0.0, 1.0, d.tone),
+            grain: pick(self.grain, 0.0, 1.0, d.grain),
         }
     }
 }
@@ -694,8 +699,21 @@ const MERRILL_RED_TRIM: f64 = 1.024;
 /// +3.4/+4.1/+1.6/+7.0/+7.6(/255)と 5 枚とも青く、B−G が 0 になる倍率は 0.983/0.982/0.986/0.975/0.976
 /// 倍に揃った。0.98 倍(1.147)で B−G は −0.5/−0.3/−0.7/+1.4/+1.3、R−G は +0.5/+1.2/+0.2/+1.1/−0.2。
 /// 赤は動かさない(1.005 倍にすると R−G が +0.5〜+2.0 に悪化)。
+///
+/// 青の 1.147 は dp0 Quattro のトーン(と、同じトーンを流用する dp1〜dp3 Quattro)に対して測ったので、
+/// その機種だけに掛ける(`color_temp_blue_scale`)。ほかの Quattro(sd Quattro など)は、トーンを
+/// 入れる前の 1.17 のまま。色温度指定の参照は dp0 の 5000K だけで、sd Quattro は測っていない。
 const COLOR_TEMP_RED_SCALE: f64 = 1.185;
-const COLOR_TEMP_BLUE_SCALE: f64 = 1.147;
+const COLOR_TEMP_BLUE_SCALE: f64 = 1.17;
+const DP0_COLOR_TEMP_BLUE_SCALE: f64 = 1.147;
+
+/// 色温度指定 WB の青の倍率。dp0〜dp3 Quattro(CAMERAID 80〜83)だけ測り直した値。
+fn color_temp_blue_scale(camf: &Camf) -> f64 {
+    match camf.number("CAMERAID").map(|v| v as u32) {
+        Some(80..=83) => DP0_COLOR_TEMP_BLUE_SCALE,
+        _ => COLOR_TEMP_BLUE_SCALE,
+    }
+}
 
 /// White balance by colour temperature (Quattro "ColorTemp" setting): the gains and colour
 /// matrix are interpolated from `ColorTempTableInfo` at the file's `ColorTempValue`. The table has
@@ -718,7 +736,7 @@ fn color_temp_calibration(camf: &Camf) -> Option<(f64, [f64; 3], [f64; 9])> {
     let gain = [
         row[2] * COLOR_TEMP_RED_SCALE,
         1.0,
-        row[1] * COLOR_TEMP_BLUE_SCALE,
+        row[1] * color_temp_blue_scale(camf),
     ];
     let cc: [f64; 9] = std::array::from_fn(|c| row[3 + c]);
     Some((kelvin, gain, cc))
@@ -1375,8 +1393,10 @@ mod tests {
             red: f64::NAN,
             blue: 99.0,
             tone: -1.0,
+            grain: 2.0,
         };
         let s = bad.sanitized();
+        assert_eq!(s.grain, 0.0);
         assert_eq!(s.color_space, ColorSpace::AdobeRgb);
         assert_eq!((s.red, s.blue, s.tone), (1.0, 1.0, TONE_STRENGTH));
         assert_eq!(s.white_balance, Some("Sunlight"));
@@ -1649,12 +1669,49 @@ mod tests {
         assert_eq!(k, 5000.0);
         // Halfway: red 0.9, blue 0.9, each scaled to the WBGain convention; green stays 1.
         assert!((gain[0] - 0.9 * COLOR_TEMP_RED_SCALE).abs() < 1e-9);
+        // 機種が分からないファイルは、測り直す前の青の倍率のまま。
         assert!((gain[2] - 0.9 * COLOR_TEMP_BLUE_SCALE).abs() < 1e-9);
         assert_eq!(gain[1], 1.0);
         assert_eq!(&cc[..3], &[3.0, -3.0, 1.0]);
         // Outside the table the nearest row is used.
         let (_, low, _) = color_temp_calibration(&color_temp_camf(1000.0)).unwrap();
         assert!((low[0] - 0.8 * COLOR_TEMP_RED_SCALE).abs() < 1e-9);
+    }
+
+    #[test]
+    fn color_temp_blue_scale_is_remeasured_only_for_dp0_to_dp3_quattro() {
+        let blue = |camera: Option<f64>| {
+            let mut c = color_temp_camf(5000.0);
+            if let Some(id) = camera {
+                c.0.push(m("CAMERAID", &[id]));
+            }
+            let (_, gain, _) = color_temp_calibration(&c).unwrap();
+            gain[2] / 0.9
+        };
+        for id in [80.0, 81.0, 82.0, 83.0] {
+            assert!(
+                (blue(Some(id)) - DP0_COLOR_TEMP_BLUE_SCALE).abs() < 1e-9,
+                "{id}"
+            );
+        }
+        // sd Quattro(40)、sd Quattro H(41)、隣の ID、機種不明は従来の倍率。
+        for id in [
+            Some(40.0),
+            Some(41.0),
+            Some(79.0),
+            Some(84.0),
+            Some(77.0),
+            None,
+        ] {
+            assert!((blue(id) - COLOR_TEMP_BLUE_SCALE).abs() < 1e-9, "{id:?}");
+        }
+        // 赤は機種によらず同じ。
+        let red = |id: f64| {
+            let mut c = color_temp_camf(5000.0);
+            c.0.push(m("CAMERAID", &[id]));
+            color_temp_calibration(&c).unwrap().1[0]
+        };
+        assert_eq!(red(83.0), red(40.0));
     }
 
     #[test]

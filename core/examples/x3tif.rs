@@ -1,4 +1,4 @@
-//! CLI harness: x3tif <in.x3f> <out.tif> [raw|developed [ev|auto [srgb|adobe]]]
+//! CLI harness: x3tif <in.x3f> <out.tif> [raw|developed [ev|auto [srgb|adobe [grain]]]]
 //!              x3tif <in.x3f> <out.png> preview [ev [max_side]]
 use std::{env, fs, io::BufWriter, process::ExitCode};
 use x3tif_core::develop::{ColorSpace, Exposure, Mode, Tuning};
@@ -13,8 +13,8 @@ fn read_input(path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
-    if !(3..=6).contains(&args.len()) {
-        eprintln!("usage: x3tif <in.x3f> <out.tif> [raw|developed [ev|auto [srgb|adobe]]]");
+    if !(3..=7).contains(&args.len()) {
+        eprintln!("usage: x3tif <in.x3f> <out.tif> [raw|developed [ev|auto [srgb|adobe [grain]]]]");
         eprintln!("       x3tif <in.x3f> <out.png> preview [ev [max_side]]");
         return ExitCode::from(2);
     }
@@ -63,6 +63,7 @@ fn main() -> ExitCode {
                         return ExitCode::from(2);
                     }
                 },
+                grain: args.get(6).and_then(|v| v.parse().ok()).unwrap_or(0.0),
                 ..Tuning::default()
             },
         ),

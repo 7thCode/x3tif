@@ -117,6 +117,11 @@
         <input type="range" id="tone" min="0" max="1" step="0.01" value="0.5">
         <output id="tone-out">0.50</output>
       </div>
+      <div class="row" title="Quattro の粒状感と色ノイズの抑制。0 は Photo Pro に合わせた値、1 は強く消します。保存する TIFF にだけ効き、プレビューには反映されません">
+        <label for="grain">粒状感</label>
+        <input type="range" id="grain" min="0" max="1" step="0.01" value="0">
+        <output id="grain-out">0.00</output>
+      </div>
     </fieldset>
     <div id="note"></div>
 
@@ -143,8 +148,8 @@
   for (const [v, label] of WB) $('wb').add(new Option(label, v));
 
   // The calibrated values: what "標準に戻す" returns to, and what a missing settings file means.
-  const STANDARD = { color_space: 'sRGB', white_balance: null, red: 1, blue: 1, tone: 0.5 };
-  const sliders = ['red', 'blue', 'tone'];
+  const STANDARD = { color_space: 'sRGB', white_balance: null, red: 1, blue: 1, tone: 0.5, grain: 0 };
+  const sliders = ['red', 'blue', 'tone', 'grain'];
 
   const files = [];          // { path, name, state, cls }
   let selected = -1;
@@ -163,6 +168,7 @@
       red: Number($('red').value),
       blue: Number($('blue').value),
       tone: Number($('tone').value),
+      grain: Number($('grain').value),
     };
   }
   function apply(s) {
@@ -289,7 +295,8 @@
   $('reset').onclick = () => { apply(STANDARD); schedule(); say(''); };
 
   // ---- controls ----
-  for (const k of sliders) $(k).oninput = () => { $(k + '-out').textContent = fmt($(k).value); schedule(); };
+  // 粒状感は保存する TIFF にだけ効くので、プレビューは作り直さない。
+  for (const k of sliders) $(k).oninput = () => { $(k + '-out').textContent = fmt($(k).value); if (k !== 'grain') schedule(); };
   $('wb').onchange = schedule;
   $('ev').oninput = () => { $('ev-out').textContent = fmt($('ev').value, true); schedule(); };
   $('auto').onchange = () => { $('ev').disabled = $('auto').checked; schedule(); };
