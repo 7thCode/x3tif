@@ -8,3 +8,8 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# 開発起動(tauri dev)でも画像処理が実用的な速さになるよう、core だけ最適化する。
+# 依存を含む全体を最適化するより再ビルドが速く、デバッグ情報はそのまま残る。
+[profile.dev.package.x3tif-core]
+opt-level = 3
