@@ -51,6 +51,7 @@ impl Loaded {
         let mut raw = x3f.decode()?;
         develop::repair_highlight_pixels(&mut raw, &camf);
         develop::repair_autofocus_pixels(&mut raw, &camf);
+        develop::denoise_raw(&mut raw, &camf);
         let (w, h) = match &raw {
             Raw::Merrill { width, height, .. } => (*width, *height),
             Raw::Quattro {

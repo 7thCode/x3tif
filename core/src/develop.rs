@@ -337,6 +337,122 @@ pub fn repair_autofocus_pixels(raw: &mut Raw, camf: &Camf) {
     interpolate_pixels(low, *low_width, *low_height, 3, &chroma.points());
 }
 
+/// ISO ゲイン(CaptureISO / SensorISO)。Merrill の生データは ISO によらず暗いまま(ISO 6400 で
+/// 黒レベルの数カウント上)で、現像でこの倍率を掛けて明るさを合わせる。
+fn iso_gain(camf: &Camf) -> Option<f64> {
+    match (camf.number("CaptureISO"), camf.number("SensorISO")) {
+        (Some(c), Some(s)) if s > 0.0 => Some(c / s),
+        _ => None,
+    }
+}
+
+/// 生データの平滑化の σ(画素)の測定点。(log2 of ISO ゲイン, σ)。ISO 100 は 0(掛けない)。
+///
+/// DP1 Merrill の ISO 400/1600/6400(`_P1M2077/2078/2081`。同じ被写体)を、Photo Pro 6.9.0 の既定設定
+/// (NR 2/4、Adobe RGB、16bit)の TIFF と、`tiffcmp --bands` で比べた全体 RMSE(/255)の底で決めた。
+/// 平滑化なしは 6.77 / 14.20 / 32.07(低周波 4.09 / 7.32 / 18.48)。
+/// - ISO 400: σ 0.4/0.5/0.6/0.8/1.0 → 6.42/6.05/6.03/6.28/6.57(底は 0.5〜0.6)
+/// - ISO 1600: σ 0.5/0.6/0.7/0.8/0.9/1.0/1.5 → 10.89/10.03/9.84/9.90/10.06/10.26/11.36(底は 0.7〜0.8)
+/// - ISO 6400: σ 0.8/1.2/1.3/1.4/1.5/2.0 → 21.28/19.93/19.83/19.79/19.80/20.22(底は 1.3〜1.5)
+///
+/// ISO 100 に σ 0.5 を掛けても 4.55 → 4.56 でほぼ変わらない(ISO 100 は掛けない)。
+/// 底の位置が ISO で一様には増えない(0.6/0.75/1.4)ので、測定点の間は log2 で線形に補う。
+/// ISO 200/800/3200 は測っていない。
+const DENOISE_SIGMA: [(f64, f64); 4] = [(0.0, 0.0), (2.0, 0.6), (4.0, 0.75), (6.0, 1.4)];
+
+/// これより小さい σ は掛けない(ISO 200 の補間値 0.3 は画素に 1/10 も混ざらず、意味がない)。
+const DENOISE_MIN_SIGMA: f64 = 0.45;
+
+/// 生データの平滑化の σ(画素)。0 なら掛けない。`g` は `iso_gain`。
+fn denoise_sigma(g: f64) -> f64 {
+    if !(g.is_finite() && g > 0.0) {
+        return 0.0;
+    }
+    let l = g.log2().min(DENOISE_SIGMA[DENOISE_SIGMA.len() - 1].0);
+    let sigma = DENOISE_SIGMA
+        .windows(2)
+        .find(|w| l <= w[1].0)
+        .map_or(0.0, |w| {
+            w[0].1 + (w[1].1 - w[0].1) * (l - w[0].0) / (w[1].0 - w[0].0)
+        });
+    if sigma >= DENOISE_MIN_SIGMA {
+        sigma
+    } else {
+        0.0
+    }
+}
+
+/// DP Merrill の生データを、現像の前に ISO ゲインに応じてぼかす。
+///
+/// ISO を上げた生データは信号が小さく(ISO 6400 で黒レベルの数カウント上)、現像で最大 64 倍に
+/// 増幅されたノイズと量子化がトーンカーブを通ると、暗部が持ち上がって 16 画素の平均にも偏りが
+/// 残る。Photo Pro は曲線の前でノイズを消している。曲線の後の仕上げ(`finish`)では直らない。
+/// 遮光領域は混ぜない(黒レベルの平均を変えないため)ので、有効領域の内側だけで行う。
+/// 生データ出力には使わない(無損失の約束)。
+pub fn denoise_raw(raw: &mut Raw, camf: &Camf) {
+    if !matches!(camf.number("CAMERAID"), Some(id) if (77.0..=78.0).contains(&id)) {
+        return;
+    }
+    let Raw::Merrill { width, height, rgb } = raw else {
+        return;
+    };
+    let Some(sigma) = iso_gain(camf).map(denoise_sigma).filter(|s| *s > 0.0) else {
+        return;
+    };
+    let area = crate::convert::active_area(camf, *width, *height);
+    blur_area(rgb, *width, &area, sigma);
+}
+
+/// インターリーブされた 3 チャンネルの `area` の内側を、分離型のガウシアン(端は内側の端画素で延長)でぼかす。
+fn blur_area(rgb: &mut [u16], stride: usize, area: &crate::convert::Area, sigma: f64) {
+    let (aw, ah) = (area.width, area.height);
+    if aw == 0 || ah == 0 || rgb.len() < (area.y + ah) * stride * 3 {
+        return;
+    }
+    let radius = (sigma * 3.0).ceil() as usize;
+    let mut kernel: Vec<f32> = (0..=2 * radius)
+        .map(|i| {
+            let d = i as f64 - radius as f64;
+            (-d * d / (2.0 * sigma * sigma)).exp() as f32
+        })
+        .collect();
+    let total: f32 = kernel.iter().sum();
+    kernel.iter_mut().for_each(|k| *k /= total);
+
+    let mut plane = vec![0f32; aw * ah];
+    let mut tmp = vec![0f32; aw * ah];
+    for c in 0..3 {
+        for y in 0..ah {
+            let row = ((area.y + y) * stride + area.x) * 3 + c;
+            for x in 0..aw {
+                plane[y * aw + x] = rgb[row + x * 3] as f32;
+            }
+        }
+        // 横
+        for y in 0..ah {
+            let src = &plane[y * aw..(y + 1) * aw];
+            for x in 0..aw {
+                let mut acc = 0.0;
+                for (i, k) in kernel.iter().enumerate() {
+                    acc += k * src[(x + i).saturating_sub(radius).min(aw - 1)];
+                }
+                tmp[y * aw + x] = acc;
+            }
+        }
+        // 縦
+        for y in 0..ah {
+            let row = ((area.y + y) * stride + area.x) * 3 + c;
+            for x in 0..aw {
+                let mut acc = 0.0;
+                for (i, k) in kernel.iter().enumerate() {
+                    acc += k * tmp[(y + i).saturating_sub(radius).min(ah - 1) * aw + x];
+                }
+                rgb[row + x * 3] = acc.round().clamp(0.0, 65535.0) as u16;
+            }
+        }
+    }
+}
+
 /// Sensor bit depth from CAMF (`ImageDepth`); 14 bit is what Quattro and 12 bit what Merrill report.
 fn image_depth(camf: &Camf) -> Option<u32> {
     camf.number("ImageDepth")
@@ -816,10 +932,7 @@ impl Developer {
         }
         gain[0] *= tuning.red;
         gain[2] *= tuning.blue;
-        let iso = match (camf.number("CaptureISO"), camf.number("SensorISO")) {
-            (Some(c), Some(s)) if s > 0.0 => c / s,
-            _ => 1.0,
-        };
+        let iso = iso_gain(camf).unwrap_or(1.0);
         let mut matrix = [[0.0; 3]; 3];
         for (i, row) in matrix.iter_mut().enumerate() {
             for (j, m) in row.iter_mut().enumerate() {
@@ -1352,6 +1465,163 @@ mod tests {
         let mut c = camf(1.0);
         c.0.push(m("CAMERAID", &[camera]));
         c
+    }
+
+    /// 幅 w、高さ h の Merrill。画素値は決定的な疑似乱数(平均 base、振れ幅 ±amp)。
+    fn noisy_merrill(w: usize, h: usize, base: u16, amp: u16) -> Raw {
+        let mut seed = 12345u32;
+        let rgb = (0..w * h * 3)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                base + ((seed >> 16) % (2 * amp as u32 + 1)) as u16 - amp
+            })
+            .collect();
+        Raw::Merrill {
+            width: w,
+            height: h,
+            rgb,
+        }
+    }
+
+    fn merrill_at_iso(iso: f64) -> Camf {
+        let mut c = with_camera(77.0);
+        c.0.push(m("SensorISO", &[100.0]));
+        c.0.push(m("CaptureISO", &[iso]));
+        c
+    }
+
+    /// テスト用: 全画素値(Merrill はインターリーブ、Quattro は低解像度層の後に高解像度層)。
+    fn samples(raw: &Raw) -> Vec<u16> {
+        match raw {
+            Raw::Merrill { rgb, .. } => rgb.clone(),
+            Raw::Quattro { low, top, .. } => low.iter().chain(top).copied().collect(),
+        }
+    }
+
+    fn variance(raw: &Raw) -> f64 {
+        let Raw::Merrill { rgb, .. } = raw else {
+            unreachable!()
+        };
+        let mean = rgb.iter().map(|&v| v as f64).sum::<f64>() / rgb.len() as f64;
+        rgb.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / rgb.len() as f64
+    }
+
+    fn mean(raw: &Raw) -> f64 {
+        let Raw::Merrill { rgb, .. } = raw else {
+            unreachable!()
+        };
+        rgb.iter().map(|&v| v as f64).sum::<f64>() / rgb.len() as f64
+    }
+
+    #[test]
+    fn denoise_sigma_grows_with_iso_and_is_off_for_low_iso() {
+        // ISO 100 / 200 は掛けない。CaptureISO が 399.9 のように少し下がっても ISO 400 は掛かる
+        assert_eq!(denoise_sigma(0.999), 0.0);
+        assert_eq!(denoise_sigma(1.999), 0.0);
+        assert!((denoise_sigma(3.999) - 0.6).abs() < 1e-3);
+        assert!((denoise_sigma(15.999) - 0.75).abs() < 1e-3);
+        assert!((denoise_sigma(63.999) - 1.4).abs() < 1e-3);
+        // ISO の上限の先は 6400 の値のまま。壊れた値は掛けない
+        assert!((denoise_sigma(1000.0) - 1.4).abs() < 1e-9);
+        assert_eq!(denoise_sigma(f64::NAN), 0.0);
+        assert_eq!(denoise_sigma(0.0), 0.0);
+    }
+
+    #[test]
+    fn denoise_raw_leaves_low_iso_untouched() {
+        for iso in [100.0, 200.0] {
+            let mut r = noisy_merrill(32, 32, 100, 10);
+            let before = samples(&r);
+            denoise_raw(&mut r, &merrill_at_iso(iso));
+            assert_eq!(samples(&r), before, "ISO {iso}");
+        }
+    }
+
+    #[test]
+    fn denoise_raw_only_touches_developed_merrill_with_a_known_iso() {
+        let mut r = noisy_merrill(32, 32, 100, 10);
+        let before = samples(&r);
+        // CAMERAID が Merrill でない
+        let mut other = merrill_at_iso(6400.0);
+        other.0.retain(|e| e.name != "CAMERAID");
+        other.0.push(m("CAMERAID", &[83.0]));
+        denoise_raw(&mut r, &other);
+        assert_eq!(samples(&r), before);
+        // ISO が分からない
+        denoise_raw(&mut r, &with_camera(77.0));
+        assert_eq!(samples(&r), before);
+        // Quattro の生データ
+        let mut q = Raw::Quattro {
+            low_width: 2,
+            low_height: 2,
+            low: vec![5; 12],
+            top_width: 4,
+            top_height: 4,
+            top: vec![7; 16],
+        };
+        let q0 = samples(&q);
+        denoise_raw(&mut q, &merrill_at_iso(6400.0));
+        assert_eq!(samples(&q), q0);
+    }
+
+    #[test]
+    fn denoise_raw_cuts_flat_noise_and_keeps_the_mean() {
+        let mut r = noisy_merrill(64, 64, 1000, 40);
+        let (v0, m0) = (variance(&r), mean(&r));
+        denoise_raw(&mut r, &merrill_at_iso(6400.0));
+        assert!(variance(&r) < v0 / 4.0, "{} -> {}", v0, variance(&r));
+        assert!((mean(&r) - m0).abs() < 2.0);
+    }
+
+    #[test]
+    fn denoise_raw_keeps_a_step_edge_within_a_few_pixels() {
+        let (w, h) = (40, 8);
+        let mut rgb = vec![0u16; w * h * 3];
+        for y in 0..h {
+            for x in 20..w {
+                rgb[(y * w + x) * 3..(y * w + x) * 3 + 3].copy_from_slice(&[1000; 3]);
+            }
+        }
+        let mut r = Raw::Merrill {
+            width: w,
+            height: h,
+            rgb,
+        };
+        denoise_raw(&mut r, &merrill_at_iso(6400.0));
+        let Raw::Merrill { rgb, .. } = &r else {
+            unreachable!()
+        };
+        let at = |x: usize| rgb[(4 * w + x) * 3];
+        // σ 1.4 ならエッジから 5 画素離れれば元の値に戻っている
+        assert!(at(14) <= 2 && at(25) >= 998, "{} {}", at(14), at(25));
+        assert!(at(19) > 0 && at(20) < 1000);
+    }
+
+    #[test]
+    fn denoise_raw_does_not_mix_in_the_dark_shield() {
+        // ActiveImageArea の外(遮光領域)は、内側の画素に混ざらず、自分も変わらない
+        let (w, h) = (24, 12);
+        let mut rgb = vec![500u16; w * h * 3];
+        for y in 0..h {
+            for x in 0..4 {
+                rgb[(y * w + x) * 3..(y * w + x) * 3 + 3].copy_from_slice(&[9; 3]);
+            }
+        }
+        let mut c = merrill_at_iso(6400.0);
+        c.0.push(m("ActiveImageArea", &[4.0, 0.0, 23.0, 11.0]));
+        let mut r = Raw::Merrill {
+            width: w,
+            height: h,
+            rgb,
+        };
+        denoise_raw(&mut r, &c);
+        let Raw::Merrill { rgb, .. } = &r else {
+            unreachable!()
+        };
+        assert!(rgb.chunks(3).enumerate().all(|(i, p)| {
+            let want = if i % w < 4 { 9 } else { 500 };
+            p == [want; 3]
+        }));
     }
 
     #[test]
