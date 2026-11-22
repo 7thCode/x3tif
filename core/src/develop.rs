@@ -346,23 +346,6 @@ fn iso_gain(camf: &Camf) -> Option<f64> {
     }
 }
 
-/// 生データの平滑化の σ(画素)の測定点。(log2 of ISO ゲイン, σ)。ISO 100 は 0(掛けない)。
-///
-/// DP1 Merrill の ISO 400/1600/6400(`_P1M2077/2078/2081`。同じ被写体)を、Photo Pro 6.9.0 の既定設定
-/// (NR 2/4、Adobe RGB、16bit)の TIFF と、`tiffcmp --bands` で比べた全体 RMSE(/255)の底で決めた。
-/// 平滑化なしは 6.77 / 14.20 / 32.07(低周波 4.09 / 7.32 / 18.48)。
-/// - ISO 400: σ 0.4/0.5/0.6/0.8/1.0 → 6.42/6.05/6.03/6.28/6.57(底は 0.5〜0.6)
-/// - ISO 1600: σ 0.5/0.6/0.7/0.8/0.9/1.0/1.5 → 10.89/10.03/9.84/9.90/10.06/10.26/11.36(底は 0.7〜0.8)
-/// - ISO 6400: σ 0.8/1.2/1.3/1.4/1.5/2.0 → 21.28/19.93/19.83/19.79/19.80/20.22(底は 1.3〜1.5)
-///
-/// ISO 100 に σ 0.5 を掛けても 4.55 → 4.56 でほぼ変わらない(ISO 100 は掛けない)。
-/// 底の位置が ISO で一様には増えない(0.6/0.75/1.4)ので、測定点の間は log2 で線形に補う。
-/// ISO 200/800/3200 は測っていない。
-const DENOISE_SIGMA: [(f64, f64); 4] = [(0.0, 0.0), (2.0, 0.6), (4.0, 0.75), (6.0, 1.4)];
-
-/// これより小さい σ は掛けない(ISO 200 の補間値 0.3 は画素に 1/10 も混ざらず、意味がない)。
-const DENOISE_MIN_SIGMA: f64 = 0.45;
-
 /// 測定点 `(x, y)`(x の昇順)の間を線形に補う。x が範囲の外なら端の値。
 fn interpolate(points: &[(f64, f64)], x: f64) -> f64 {
     let x = x.clamp(points[0].0, points[points.len() - 1].0);
@@ -371,40 +354,117 @@ fn interpolate(points: &[(f64, f64)], x: f64) -> f64 {
     })
 }
 
-/// 生データの平滑化の σ(画素)。0 なら掛けない。`g` は `iso_gain`。
-fn denoise_sigma(g: f64) -> f64 {
-    if !(g.is_finite() && g > 0.0) {
-        return 0.0;
-    }
-    let sigma = interpolate(&DENOISE_SIGMA, g.log2());
-    if sigma >= DENOISE_MIN_SIGMA {
-        sigma
-    } else {
-        0.0
+/// 生データのノイズ除去(バイラテラル)の強さ。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Denoise {
+    /// 空間のガウシアンの σ(各層の画素数)。窓の半径は `radius()`。
+    sigma_s: f64,
+    /// 範囲の幅。ノイズの標準偏差の何倍までの差を「同じもの」として混ぜるか。
+    k: f64,
+}
+
+impl Denoise {
+    fn radius(&self) -> usize {
+        (self.sigma_s * 1.4).round().max(1.0) as usize
     }
 }
 
-/// 生データを、現像の前に ISO に応じてぼかす(DP Merrill と dp0 Quattro)。
+/// 測定点 `(log2(ISO / 100), 空間 σ, k)` の間を線形に補って `Denoise` にする。
+fn denoise_for(table: &[(f64, f64, f64)], l: f64) -> Denoise {
+    let col = |f: fn(&(f64, f64, f64)) -> f64| {
+        let pts: Vec<(f64, f64)> = table.iter().map(|p| (p.0, f(p))).collect();
+        interpolate(&pts, l)
+    };
+    Denoise {
+        sigma_s: col(|p| p.1),
+        k: col(|p| p.2),
+    }
+}
+
+/// DP Merrill のノイズ除去の測定点。(log2(CaptureISO / 100), 空間 σ, k)。
 ///
-/// ISO を上げた生データのノイズは、現像で増幅されてトーンカーブを通ると暗部を持ち上げ、16 画素の
-/// 平均にも偏りが残る(Merrill は信号が黒レベルの数カウント上しかなく、量子化の段差も効く)。
-/// Photo Pro は曲線の前でノイズを消している。曲線の後の仕上げ(`finish`)では直らない。
+/// 生データのカウントで見たノイズは σ² = r² + a × (黒レベルからの信号) で、r は遮光領域の標準偏差
+/// (R/G/B で 1.6/1.7/0.5)、a は明るい平坦部の実測(`MERRILL_NOISE_A`)。Merrill は ISO を
+/// デジタルで掛けるので、カウントで見たノイズは ISO によらず一定(信号が ISO に反比例して小さくなる)。
+/// DP1 Merrill の ISO 100/400/1600/6400(`_P1M2076〜2081` と ISO 100 の 5 枚。ISO 400 以上は同じ被写体)を
+/// Photo Pro 6.9.0 の既定設定(NR 2/4、Adobe RGB、16bit)の TIFF と、`tiffcmp --bands` で比べた
+/// 全体 RMSE(/255)の底で決めた。
+///
+/// - ISO 100(5 枚、LOW 解像度。変更前 → 後): 1980 4.12→3.95、1993 4.59→4.17、2038 4.81→4.72、
+///   2048 4.58→4.49、2076 4.55→4.35。2044(4928×3264 の高解像度モード)は 6.85→6.83。k は 2〜2.5 が底で、
+///   4 以上では 1993/1980 で悪化する
+/// - ISO 400: 5.65(k 3。k 2/4 で 5.68/5.67。Gaussian は 6.03)
+/// - ISO 1600: 8.46(k 5。k 8 で 8.43。Gaussian は 9.85)。最細帯域の相関は Gaussian の 0.3 → 0.84
+/// - ISO 6400: 19.64(空間 σ 2・k 5。σ 1.5 で 19.83、k 3/8 で 20.14/19.80。Gaussian は 19.79)。信号より
+///   ノイズが大きく、最細帯域の相関は 0.06〜0.08 のまま(細部はもともと取れない)
+const MERRILL_DENOISE: [(f64, f64, f64); 4] = [
+    (0.0, 1.5, 2.5),
+    (2.0, 1.5, 3.0),
+    (4.0, 1.5, 5.0),
+    (6.0, 2.0, 5.0),
+];
+
+/// Merrill の `a`(R, G, B)。ISO 100 の LOW 解像度で、信号の大きい平坦部の分散から求めた。
+const MERRILL_NOISE_A: [f64; 3] = [0.03, 0.03, 0.07];
+
+/// dp0 Quattro のノイズ除去の測定点。(log2(CaptureISO / 100), 空間 σ, k)。
+///
+/// dp0 Quattro の ISO 100〜3200(`_P0Q0307〜0311`。同じ被写体)を、Photo Pro 6.9.0 の既定設定の TIFF と
+/// 比べた全体 RMSE(/255、Gaussian → バイラテラル): ISO 100 4.67→4.54、400 6.24→5.78、800 7.77→6.79、
+/// 1600 10.70→9.65、3200 14.84→14.42。ISO 800 は測定点に入れず、補間値で測った(k 3 は 6.95、k 6 は 6.79)。
+/// 最細帯域の相関は 1600 で 0.31→0.48、3200 で 0.06→0.24。空間 σ を 4 にすると 3200 は 14.22 になるが
+/// 低周波が悪化するので 3 のまま。`a` を 0.5/2/4 倍にしても RMSE は 4.52/4.60/4.70(ISO 100)、
+/// 9.58/9.82/10.04(ISO 1600)で、`a` への感度は低い。
+const DP0_QUATTRO_DENOISE: [(f64, f64, f64); 4] = [
+    (0.0, 1.5, 2.0),
+    (2.0, 1.5, 4.0),
+    (4.0, 3.0, 8.0),
+    (5.0, 3.0, 8.0),
+];
+
+/// Quattro の `a` を SensorISO 100 に換算した値(低解像度層 R, G と上層)。アナログゲイン(SensorISO)に比例する。
+/// ISO 100 と 3200 の平坦部の分散から見積もった値の半分(半分の方が RMSE がわずかに低い)。
+const QUATTRO_NOISE_A: [f64; 3] = [0.12, 0.08, 0.3];
+
+/// 生データを、現像の前にノイズ除去する(DP Merrill と dp0 Quattro)。
+///
+/// 生データのノイズは現像で増幅されてトーンカーブを通ると暗部を持ち上げ、16 画素の平均にも偏りが
+/// 残る(Merrill の高感度は信号が黒レベルの数カウント上しかなく、量子化の段差も効く)。Photo Pro は
+/// 曲線の前でノイズを消している。曲線の後の仕上げ(`finish`)では直らない。
+///
+/// ノイズの大きさに応じて重みを付けるバイラテラル(信号ごとのノイズ σ の `k` 倍までの差だけを混ぜる)
+/// で、ノイズより大きいエッジやディテールは残す。同じ ISO の Gaussian(#32/#33 の方式)より、
+/// Photo Pro との RMSE が低く、最細帯域の相関が高かった(細部が残る)。
 /// 遮光領域は混ぜない(黒レベルの平均を変えないため)ので、有効領域の内側だけで行う。
-/// 生データ出力には使わない(無損失の約束)。
+/// 遮光領域が読めない・ISO が分からないときは何もしない。生データ出力には使わない(無損失の約束)。
 pub fn denoise_raw(raw: &mut Raw, camf: &Camf) {
     let camera = camf.number("CAMERAID").map(|v| v as u32);
+    // カメラと生データの形の組が合うものだけ(Merrill は 77/78、dp0 Quattro は 83)
+    let supported = match raw {
+        Raw::Merrill { .. } => matches!(camera, Some(77 | 78)),
+        Raw::Quattro { .. } => camera == Some(83),
+    };
+    if !supported {
+        return;
+    }
+    let Ok(dark) = dark_levels(raw, camf) else {
+        return;
+    };
     match raw {
-        Raw::Merrill { width, height, rgb } if matches!(camera, Some(77 | 78)) => {
-            let Some(sigma) = iso_gain(camf).map(denoise_sigma).filter(|s| *s > 0.0) else {
+        Raw::Merrill { width, height, rgb } => {
+            let Some(g) = iso_gain(camf).filter(|g| g.is_finite() && *g > 0.0) else {
                 return;
             };
+            let params = denoise_for(&MERRILL_DENOISE, g.log2());
             let area = crate::convert::active_area(camf, *width, *height);
             for c in 0..3 {
-                blur_plane(
+                let noise = Noise::new(dark[c], MERRILL_NOISE_A[c]);
+                bilateral_plane(
                     rgb,
                     (*width * 3, 3, c),
                     (area.x, area.y, area.width, area.height),
-                    sigma,
+                    noise,
+                    params,
                 );
             }
         }
@@ -415,130 +475,161 @@ pub fn denoise_raw(raw: &mut Raw, camf: &Camf) {
             top_width,
             top_height,
             top,
-        } if camera == Some(83) => {
-            let Some((sigma_low, sigma_top)) = quattro_sigmas(camf) else {
+        } => {
+            let Some(iso) = camf
+                .number("CaptureISO")
+                .filter(|v| v.is_finite() && *v > 0.0)
+            else {
                 return;
             };
+            let params = denoise_for(&DP0_QUATTRO_DENOISE, (iso / 100.0).log2());
+            let analog = camf
+                .number("SensorISO")
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .map_or(1.0, |v| v / 100.0);
+            let noise = |c: usize| Noise::new(dark[c], QUATTRO_NOISE_A[c] * analog);
             let (full_w, full_h) = (
                 (*top_width).min(2 * *low_width),
                 (*top_height).min(2 * *low_height),
             );
             let area = crate::convert::active_area(camf, full_w, full_h);
-            if sigma_top > 0.0 {
-                blur_plane(
-                    top,
-                    (*top_width, 1, 0),
-                    (area.x, area.y, area.width, area.height),
-                    sigma_top,
-                );
-            }
-            if sigma_low > 0.0 {
-                // 低解像度層の画素は全解像度の 2 画素分。領域は内側へ丸める
-                let (x0, y0) = (area.x.div_ceil(2), area.y.div_ceil(2));
-                let (x1, y1) = ((area.x + area.width) / 2, (area.y + area.height) / 2);
-                if x1 > x0 && y1 > y0 {
-                    for c in 0..2 {
-                        blur_plane(
-                            low,
-                            (*low_width * 3, 3, c),
-                            (x0, y0, x1 - x0, y1 - y0),
-                            sigma_low,
-                        );
-                    }
+            bilateral_plane(
+                top,
+                (*top_width, 1, 0),
+                (area.x, area.y, area.width, area.height),
+                noise(2),
+                params,
+            );
+            // 低解像度層の画素は全解像度の 2 画素分。領域は内側へ丸める
+            let (x0, y0) = (area.x.div_ceil(2), area.y.div_ceil(2));
+            let (x1, y1) = ((area.x + area.width) / 2, (area.y + area.height) / 2);
+            if x1 > x0 && y1 > y0 {
+                for c in 0..2 {
+                    bilateral_plane(
+                        low,
+                        (*low_width * 3, 3, c),
+                        (x0, y0, x1 - x0, y1 - y0),
+                        noise(c),
+                        params,
+                    );
                 }
             }
         }
-        _ => {}
     }
 }
 
-/// dp0 Quattro の生データの平滑化の σ の測定点。(log2(CaptureISO / 100), 低解像度層の σ, 上層の σ)。
-/// σ は各層の画素数での値(低解像度層は出力の 2 画素分)。ISO 100 は 0(掛けない)。
-///
-/// dp0 Quattro の ISO 400/800/1600/3200(`_P0Q0308〜0311`。同じ被写体)を、Photo Pro 6.9.0 の既定設定
-/// (NR 2/4、Adobe RGB、16bit)の TIFF と、`tiffcmp --bands` で比べた全体 RMSE(/255)の底で決めた。
-/// 平滑化なしは 7.01 / 10.76 / 15.84 / 28.99(低周波 3.83 / 4.20 / 5.57 / 10.89)。
-/// - ISO 400: (低, 上) = (0.5, 0.5) で 6.24。(0, 0.5) 6.36、(0.5, 0) 7.07、(0.8, 1.0) 7.56、(2.0, 3.0) 11.35
-/// - ISO 1600: (1.0, 1.5) で 10.70。(0.5, 0.5) 12.70、(0.8, 1.5) 10.90、(1.5, 2.0) 10.82、(2.0, 3.0) 11.00
-/// - ISO 3200: (2.0, 3.0) で 14.84(底は (2.5, 4.0) の 14.53 で平ら)。(1.0, 1.5) 16.78、(1.5, 2.0) 15.60、(3.0, 4.0) 15.00
-/// - ISO 800 は測定点に入れず検証に使った。補間値 (0.75, 1.0) は 10.76 → 7.77 で、試した中で最良
-///   ((0.5, 0.5) 8.58、(1.0, 1.5) 7.92、(1.0, 1.0) 8.06、(1.5, 2.0) 8.65)。
-///
-/// 全体 RMSE の底は低解像度層を強くすると低周波が悪化し(ISO 3200 で 9.1 → 10.8)、高周波が下がる
-/// ので、低解像度層は底より弱めにした。ISO 200 の補間値 (0.25, 0.25) は小さすぎて掛からない。
-/// ISO 100 は掛けない。ISO 3200 より上は、3200 の値のまま。
-const QUATTRO_DENOISE_SIGMA: [(f64, f64, f64); 4] = [
-    (0.0, 0.0, 0.0),
-    (2.0, 0.5, 0.5),
-    (4.0, 1.0, 1.5),
-    (5.0, 2.0, 3.0),
-];
-
-/// dp0 Quattro の生データの平滑化の σ(低解像度層、上層)。掛けないなら `None`。
-fn quattro_sigmas(camf: &Camf) -> Option<(f64, f64)> {
-    let iso = camf
-        .number("CaptureISO")
-        .filter(|v| v.is_finite() && *v > 0.0)?;
-    let l = (iso / 100.0).log2();
-    let low: Vec<(f64, f64)> = QUATTRO_DENOISE_SIGMA.iter().map(|p| (p.0, p.1)).collect();
-    let top: Vec<(f64, f64)> = QUATTRO_DENOISE_SIGMA.iter().map(|p| (p.0, p.2)).collect();
-    let keep = |s: f64| if s >= DENOISE_MIN_SIGMA { s } else { 0.0 };
-    let (low, top) = (keep(interpolate(&low, l)), keep(interpolate(&top, l)));
-    (low > 0.0 || top > 0.0).then_some((low, top))
+/// 1 つの平面のノイズモデル: σ² = r² + a × (黒レベルからの信号)。
+#[derive(Clone, Copy)]
+struct Noise {
+    black: f64,
+    r2: f64,
+    a: f64,
 }
 
-/// 1 枚の平面の長方形 `(x0, y0, w, h)` の内側を、分離型のガウシアン(端は内側の端画素で延長)でぼかす。
+impl Noise {
+    /// `dark` は遮光領域の (平均, 標準偏差)。標準偏差は量子化の段差(1 カウント)より小さくしない。
+    fn new(dark: (f64, f64), a: f64) -> Noise {
+        Noise {
+            black: dark.0,
+            r2: dark.1.max(1.0).powi(2),
+            a,
+        }
+    }
+
+    fn variance(&self, value: f32) -> f64 {
+        self.r2 + self.a * (value as f64 - self.black).max(0.0)
+    }
+}
+
+/// 範囲の重み exp(-t) の表。t は 0 から `LUT_T_MAX`、`LUT_SCALE` 刻み。
+const LUT_SCALE: f32 = 64.0;
+const LUT_T_MAX: f32 = 16.0;
+
+fn range_lut() -> Vec<f32> {
+    (0..(LUT_T_MAX * LUT_SCALE) as usize)
+        .map(|i| (-((i as f64 + 0.5) / LUT_SCALE as f64)).exp() as f32)
+        .collect()
+}
+
+/// 1 枚の平面の長方形 `(x0, y0, w, h)` の内側を、バイラテラルでノイズ除去する(端は内側の端画素で延長)。
 /// 画素 (x, y) は `data[y * stride + x * step + offset]`(インターリーブなら `step` が 3、単独の平面なら 1)。
-/// 作業用の f32 の平面は 1 枚だけ(横の結果を置き、縦の結果は `data` に直接書く)。
-fn blur_plane(
+/// 行を分けてスレッドで並列に処理する。
+fn bilateral_plane(
     data: &mut [u16],
     (stride, step, offset): (usize, usize, usize),
     (x0, y0, w, h): (usize, usize, usize, usize),
-    sigma: f64,
+    noise: Noise,
+    params: Denoise,
 ) {
     if w == 0 || h == 0 || data.len() <= (y0 + h - 1) * stride + (x0 + w - 1) * step + offset {
         return;
     }
-    let radius = (sigma * 3.0).ceil() as usize;
-    let mut kernel: Vec<f32> = (0..=2 * radius)
+    let radius = params.radius();
+    let at = |x: usize, y: usize| (y0 + y) * stride + (x0 + x) * step + offset;
+    let src: Vec<f32> = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .map(|(x, y)| data[at(x, y)] as f32)
+        .collect();
+    let side = 2 * radius + 1;
+    let spatial: Vec<f32> = (0..side * side)
         .map(|i| {
-            let d = i as f64 - radius as f64;
-            (-d * d / (2.0 * sigma * sigma)).exp() as f32
+            let (dx, dy) = (
+                (i % side) as f64 - radius as f64,
+                (i / side) as f64 - radius as f64,
+            );
+            (-(dx * dx + dy * dy) / (2.0 * params.sigma_s * params.sigma_s)).exp() as f32
         })
         .collect();
-    let total: f32 = kernel.iter().sum();
-    kernel.iter_mut().for_each(|k| *k /= total);
-    let at = |x: usize, y: usize| (y0 + y) * stride + (x0 + x) * step + offset;
+    let lut = range_lut();
+    let k2 = 2.0 * params.k * params.k;
 
-    // 横: 行ごとに、両端を延長した行を作ってから畳み込む
-    let mut tmp = vec![0f32; w * h];
-    let mut padded = vec![0f32; w + 2 * radius];
-    for y in 0..h {
-        for (x, p) in padded.iter_mut().enumerate() {
-            *p = data[at(x.saturating_sub(radius).min(w - 1), y)] as f32;
+    // 行ごとの出力先(有効領域の行だけ)を取り出し、スレッドに均等に分ける
+    let rows: Vec<&mut [u16]> = data[y0 * stride..].chunks_mut(stride).take(h).collect();
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(h);
+    let band = h.div_ceil(threads);
+    let (src, spatial, lut) = (&src, &spatial, &lut);
+    std::thread::scope(|scope| {
+        let mut rows = rows;
+        let mut first = 0;
+        while !rows.is_empty() {
+            let rest = rows.split_off(band.min(rows.len()));
+            let mine = std::mem::replace(&mut rows, rest);
+            let start = first;
+            first += mine.len();
+            scope.spawn(move || {
+                for (i, row) in mine.into_iter().enumerate() {
+                    let y = start + i;
+                    for x in 0..w {
+                        let c = src[y * w + x];
+                        let inv = (1.0 / (k2 * noise.variance(c))) as f32;
+                        let (mut acc, mut wsum) = (0f32, 0f32);
+                        let inside = x >= radius && y >= radius && x + radius < w && y + radius < h;
+                        for (j, &ws) in spatial.iter().enumerate() {
+                            let (dx, dy) = (j % side, j / side);
+                            let v = if inside {
+                                src[(y + dy - radius) * w + (x + dx - radius)]
+                            } else {
+                                let yy = (y + dy).saturating_sub(radius).min(h - 1);
+                                let xx = (x + dx).saturating_sub(radius).min(w - 1);
+                                src[yy * w + xx]
+                            };
+                            let d = v - c;
+                            let t = (d * d * inv * LUT_SCALE) as usize;
+                            if let Some(&wr) = lut.get(t) {
+                                let wt = ws * wr;
+                                acc += wt * v;
+                                wsum += wt;
+                            }
+                        }
+                        row[(x0 + x) * step + offset] =
+                            (acc / wsum).round().clamp(0.0, 65535.0) as u16;
+                    }
+                }
+            });
         }
-        for (x, out) in tmp[y * w..(y + 1) * w].iter_mut().enumerate() {
-            let mut acc = 0.0;
-            for (k, v) in kernel.iter().zip(&padded[x..]) {
-                acc += k * v;
-            }
-            *out = acc;
-        }
-    }
-    // 縦: 出力の行ごとに、延長した行を重みを付けて足す
-    let mut row = vec![0f32; w];
-    for y in 0..h {
-        row.fill(0.0);
-        for (i, k) in kernel.iter().enumerate() {
-            let sy = (y + i).saturating_sub(radius).min(h - 1);
-            for (r, v) in row.iter_mut().zip(&tmp[sy * w..(sy + 1) * w]) {
-                *r += k * v;
-            }
-        }
-        for (x, r) in row.iter().enumerate() {
-            data[at(x, y)] = r.round().clamp(0.0, 65535.0) as u16;
-        }
-    }
+    });
 }
 
 /// Sensor bit depth from CAMF (`ImageDepth`); 14 bit is what Quattro and 12 bit what Merrill report.
@@ -1348,6 +1439,14 @@ impl Shading {
 /// Per-channel black level: the mean of the dark-shielded areas (top/bottom strips and the two
 /// side column ranges), measured on the data itself as x3f_tools does.
 fn black_levels(raw: &Raw, camf: &Camf) -> Result<[f64; 3], Error> {
+    Ok(dark_levels(raw, camf)?.map(|(mean, _)| mean))
+}
+
+/// 遮光領域 1 つ分の (長方形か, 合計, 二乗和, 画素数)。
+type DarkStat = (bool, u64, u64, u64);
+
+/// チャンネルごとの遮光領域の (平均, 標準偏差)。平均が黒レベル、標準偏差は読み出しノイズの目安。
+fn dark_levels(raw: &Raw, camf: &Camf) -> Result<[(f64, f64); 3], Error> {
     let rect = |name: &str| {
         camf.matrix(name)
             .filter(|m| m.len() == 4)
@@ -1370,7 +1469,7 @@ fn black_levels(raw: &Raw, camf: &Camf) -> Result<[f64; 3], Error> {
         return Err(Error::MissingCalibration("DarkShield"));
     }
 
-    let mut out = [0.0; 3];
+    let mut out = [(0.0, 0.0); 3];
     for (c, slot) in out.iter_mut().enumerate() {
         // Area coordinates are in full-resolution pixels; the low Quattro layers are half size.
         let (w, h, scale) = match raw {
@@ -1389,39 +1488,45 @@ fn black_levels(raw: &Raw, camf: &Camf) -> Result<[f64; 3], Error> {
                 }
             }
         };
-        // (is a rectangle, sum, count) per area.
-        let mut stats: Vec<(bool, u64, u64)> = Vec::new();
+        // (is a rectangle, sum, sum of squares, count) per area.
+        let mut stats: Vec<(bool, u64, u64, u64)> = Vec::new();
         for (is_rect, a) in &areas {
             let x0 = (a[0] * scale) as usize;
             let y0 = (a[1] * scale) as usize;
             let x1 = ((a[2] * scale).min(w as f64 - 1.0)) as usize;
             let y1 = ((a[3] * scale).min(h as f64 - 1.0)) as usize;
-            let (mut sum, mut count) = (0u64, 0u64);
+            let (mut sum, mut sum2, mut count) = (0u64, 0u64, 0u64);
             for y in y0..=y1 {
                 for x in x0..=x1 {
-                    sum += sample(raw, c, x, y) as u64;
+                    let v = sample(raw, c, x, y) as u64;
+                    sum += v;
+                    sum2 += v * v;
                     count += 1;
                 }
             }
             if count > 0 {
-                stats.push((*is_rect, sum, count));
+                stats.push((*is_rect, sum, sum2, count));
             }
         }
-        let pooled = |keep: &dyn Fn(&(bool, u64, u64)) -> bool| {
-            let (s, n) = stats
+        // 平均と標準偏差(プールした領域の)
+        let pooled = |keep: &dyn Fn(&DarkStat) -> bool| {
+            let (s, s2, n) = stats
                 .iter()
                 .filter(|a| keep(a))
-                .fold((0, 0), |t, a| (t.0 + a.1, t.1 + a.2));
-            (n > 0).then(|| s as f64 / n as f64)
+                .fold((0, 0, 0), |t, a| (t.0 + a.1, t.1 + a.2, t.2 + a.3));
+            (n > 0).then(|| {
+                let mean = s as f64 / n as f64;
+                (mean, (s2 as f64 / n as f64 - mean * mean).max(0.0).sqrt())
+            })
         };
         let reference = pooled(&|a| a.0).or_else(|| pooled(&|_| true));
-        let Some(reference) = reference else {
+        let Some((reference, _)) = reference else {
             return Err(Error::MissingCalibration("DarkShield"));
         };
         let tolerance = reference * 0.01 + 2.0;
         let trusted =
-            |a: &(bool, u64, u64)| a.0 || (a.1 as f64 / a.2 as f64 - reference).abs() <= tolerance;
-        *slot = pooled(&trusted).unwrap_or(reference);
+            |a: &DarkStat| a.0 || (a.1 as f64 / a.3 as f64 - reference).abs() <= tolerance;
+        *slot = pooled(&trusted).unwrap_or((reference, 0.0));
     }
     Ok(out)
 }
@@ -1586,83 +1691,119 @@ mod tests {
         }
     }
 
-    fn variance(raw: &Raw) -> f64 {
-        let Raw::Merrill { rgb, .. } = raw else {
-            unreachable!()
-        };
-        let mean = rgb.iter().map(|&v| v as f64).sum::<f64>() / rgb.len() as f64;
-        rgb.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / rgb.len() as f64
+    fn spread(v: impl Iterator<Item = u16>) -> f64 {
+        let v: Vec<f64> = v.map(|x| x as f64).collect();
+        let mean = v.iter().sum::<f64>() / v.len() as f64;
+        (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
     }
 
     fn mean(raw: &Raw) -> f64 {
-        let Raw::Merrill { rgb, .. } = raw else {
-            unreachable!()
-        };
-        rgb.iter().map(|&v| v as f64).sum::<f64>() / rgb.len() as f64
+        let v = samples(raw);
+        v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64
     }
 
     #[test]
-    fn denoise_sigma_grows_with_iso_and_is_off_for_low_iso() {
-        // ISO 100 / 200 は掛けない。CaptureISO が 399.9 のように少し下がっても ISO 400 は掛かる
-        assert_eq!(denoise_sigma(0.999), 0.0);
-        assert_eq!(denoise_sigma(1.999), 0.0);
-        assert!((denoise_sigma(3.999) - 0.6).abs() < 1e-3);
-        assert!((denoise_sigma(15.999) - 0.75).abs() < 1e-3);
-        assert!((denoise_sigma(63.999) - 1.4).abs() < 1e-3);
-        // ISO の上限の先は 6400 の値のまま。壊れた値は掛けない
-        assert!((denoise_sigma(1000.0) - 1.4).abs() < 1e-9);
-        assert_eq!(denoise_sigma(f64::NAN), 0.0);
-        assert_eq!(denoise_sigma(0.0), 0.0);
+    fn interpolate_follows_the_points_and_holds_the_ends() {
+        let pts = [(0.0, 0.0), (2.0, 1.0), (4.0, 3.0)];
+        assert_eq!(interpolate(&pts, -1.0), 0.0);
+        assert_eq!(interpolate(&pts, 1.0), 0.5);
+        assert_eq!(interpolate(&pts, 3.0), 2.0);
+        assert_eq!(interpolate(&pts, 9.0), 3.0);
     }
 
     #[test]
-    fn denoise_raw_leaves_low_iso_untouched() {
-        for iso in [100.0, 200.0] {
-            let mut r = noisy_merrill(32, 32, 100, 10);
-            let before = samples(&r);
-            denoise_raw(&mut r, &merrill_at_iso(iso));
-            assert_eq!(samples(&r), before, "ISO {iso}");
-        }
-    }
-
-    #[test]
-    fn denoise_raw_only_touches_developed_merrill_with_a_known_iso() {
-        let mut r = noisy_merrill(32, 32, 100, 10);
-        let before = samples(&r);
-        // CAMERAID が Merrill でない
-        let mut other = merrill_at_iso(6400.0);
-        other.0.retain(|e| e.name != "CAMERAID");
-        other.0.push(m("CAMERAID", &[83.0]));
-        denoise_raw(&mut r, &other);
-        assert_eq!(samples(&r), before);
-        // ISO が分からない
-        denoise_raw(&mut r, &with_camera(77.0));
-        assert_eq!(samples(&r), before);
-        // Quattro の生データ
-        let mut q = Raw::Quattro {
-            low_width: 2,
-            low_height: 2,
-            low: vec![5; 12],
-            top_width: 4,
-            top_height: 4,
-            top: vec![7; 16],
-        };
-        let q0 = samples(&q);
-        denoise_raw(&mut q, &merrill_at_iso(6400.0));
-        assert_eq!(samples(&q), q0);
+    fn denoise_strength_follows_the_iso_tables() {
+        let at = |t: &[(f64, f64, f64)], l: f64| denoise_for(t, l);
+        // 測定点の値、間の補間、上限の先は上限の値
+        assert_eq!(
+            at(&MERRILL_DENOISE, 0.0),
+            Denoise {
+                sigma_s: 1.5,
+                k: 2.5
+            }
+        );
+        assert_eq!(
+            at(&MERRILL_DENOISE, 2.0),
+            Denoise {
+                sigma_s: 1.5,
+                k: 3.0
+            }
+        );
+        assert_eq!(
+            at(&MERRILL_DENOISE, 3.0),
+            Denoise {
+                sigma_s: 1.5,
+                k: 4.0
+            }
+        );
+        assert_eq!(
+            at(&MERRILL_DENOISE, 6.0),
+            Denoise {
+                sigma_s: 2.0,
+                k: 5.0
+            }
+        );
+        assert_eq!(
+            at(&MERRILL_DENOISE, 9.0),
+            Denoise {
+                sigma_s: 2.0,
+                k: 5.0
+            }
+        );
+        assert_eq!(
+            at(&DP0_QUATTRO_DENOISE, 5.0),
+            Denoise {
+                sigma_s: 3.0,
+                k: 8.0
+            }
+        );
+        // ISO 800(l=3)は 400 と 1600 の中間
+        let mid = at(&DP0_QUATTRO_DENOISE, 3.0);
+        assert!((mid.sigma_s - 2.25).abs() < 1e-9 && (mid.k - 6.0).abs() < 1e-9);
+        // 窓の半径は空間 σ の約 1.4 倍(最小 1)
+        assert_eq!(
+            Denoise {
+                sigma_s: 1.5,
+                k: 1.0
+            }
+            .radius(),
+            2
+        );
+        assert_eq!(
+            Denoise {
+                sigma_s: 3.0,
+                k: 1.0
+            }
+            .radius(),
+            4
+        );
+        assert_eq!(
+            Denoise {
+                sigma_s: 0.1,
+                k: 1.0
+            }
+            .radius(),
+            1
+        );
     }
 
     #[test]
     fn denoise_raw_cuts_flat_noise_and_keeps_the_mean() {
-        let mut r = noisy_merrill(64, 64, 1000, 40);
-        let (v0, m0) = (variance(&r), mean(&r));
-        denoise_raw(&mut r, &merrill_at_iso(6400.0));
-        assert!(variance(&r) < v0 / 4.0, "{} -> {}", v0, variance(&r));
-        assert!((mean(&r) - m0).abs() < 2.0);
+        for iso in [100.0, 400.0, 6400.0] {
+            let mut r = noisy_merrill(64, 64, 1000, 40);
+            let (v0, m0) = (spread(samples(&r).into_iter()), mean(&r));
+            denoise_raw(&mut r, &merrill_at_iso(iso));
+            assert!(
+                spread(samples(&r).into_iter()) < v0 * 0.7,
+                "ISO {iso}: {v0} -> {}",
+                spread(samples(&r).into_iter())
+            );
+            assert!((mean(&r) - m0).abs() < 2.0, "ISO {iso}");
+        }
     }
 
     #[test]
-    fn denoise_raw_keeps_a_step_edge_within_a_few_pixels() {
+    fn denoise_raw_keeps_an_edge_much_larger_than_the_noise() {
         let (w, h) = (40, 8);
         let mut rgb = vec![0u16; w * h * 3];
         for y in 0..h {
@@ -1679,15 +1820,56 @@ mod tests {
         let Raw::Merrill { rgb, .. } = &r else {
             unreachable!()
         };
+        // エッジの両側は混ざらない(Gaussian だと 3 画素ほど鈍る)
         let at = |x: usize| rgb[(4 * w + x) * 3];
-        // σ 1.4 ならエッジから 5 画素離れれば元の値に戻っている
-        assert!(at(14) <= 2 && at(25) >= 998, "{} {}", at(14), at(25));
-        assert!(at(19) > 0 && at(20) < 1000);
+        assert_eq!((at(18), at(19), at(20), at(21)), (0, 0, 1000, 1000));
     }
 
     #[test]
-    fn denoise_raw_does_not_mix_in_the_dark_shield() {
-        // ActiveImageArea の外(遮光領域)は、内側の画素に混ざらず、自分も変わらない
+    fn denoise_raw_smooths_a_bump_within_the_noise() {
+        let (w, h) = (24, 24);
+        let mut rgb = vec![100u16; w * h * 3];
+        rgb[(12 * w + 12) * 3 + 1] = 103;
+        let mut r = Raw::Merrill {
+            width: w,
+            height: h,
+            rgb,
+        };
+        denoise_raw(&mut r, &merrill_at_iso(1600.0));
+        let Raw::Merrill { rgb, .. } = &r else {
+            unreachable!()
+        };
+        assert!(rgb[(12 * w + 12) * 3 + 1] < 102);
+    }
+
+    #[test]
+    fn denoise_raw_does_nothing_without_what_it_needs() {
+        let base = || noisy_merrill(32, 32, 100, 10);
+        let before = samples(&base());
+        // ISO が分からない
+        let mut r = base();
+        denoise_raw(&mut r, &with_camera(77.0));
+        assert!(samples(&r) == before);
+        // 遮光領域が読めない
+        let mut no_shield = merrill_at_iso(6400.0);
+        no_shield.0.retain(|e| e.name != "DarkShieldTop");
+        denoise_raw(&mut r, &no_shield);
+        assert!(samples(&r) == before);
+        // 対象のカメラではない(dp1 Quattro 80、sd Quattro 40、不明)
+        for camera in [Some(40.0), Some(80.0), None] {
+            let mut c = merrill_at_iso(6400.0);
+            c.0.retain(|e| e.name != "CAMERAID");
+            if let Some(id) = camera {
+                c.0.push(m("CAMERAID", &[id]));
+            }
+            denoise_raw(&mut r, &c);
+            assert!(samples(&r) == before, "{camera:?}");
+        }
+    }
+
+    #[test]
+    fn denoise_raw_keeps_the_dark_shield_of_a_merrill() {
+        // ActiveImageArea の外(x < 4)は遮光領域。内側の画素に混ざらず、自分も変わらない
         let (w, h) = (24, 12);
         let mut rgb = vec![500u16; w * h * 3];
         for y in 0..h {
@@ -1712,10 +1894,14 @@ mod tests {
         }));
     }
 
-    fn quattro_at_iso(iso: f64) -> Camf {
+    fn quattro_at_iso(iso: f64, sensor_iso: f64) -> Camf {
         let mut c = with_camera(83.0);
+        c.0.retain(|e| e.name != "DarkShieldTop");
+        // 上層の x < 16 が遮光(低解像度層では x < 8)
+        c.0.push(m("DarkShieldTop", &[0.0, 0.0, 15.0, 3.0]));
+        c.0.push(m("ActiveImageArea", &[16.0, 0.0, 63.0, 47.0]));
         c.0.push(m("CaptureISO", &[iso]));
-        c.0.push(m("SensorISO", &[100.0]));
+        c.0.push(m("SensorISO", &[sensor_iso]));
         c
     }
 
@@ -1746,68 +1932,34 @@ mod tests {
         }
     }
 
-    fn spread(v: impl Iterator<Item = u16>) -> f64 {
-        let v: Vec<f64> = v.map(|x| x as f64).collect();
-        let mean = v.iter().sum::<f64>() / v.len() as f64;
-        (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
-    }
-
-    #[test]
-    fn interpolate_follows_the_points_and_holds_the_ends() {
-        let pts = [(0.0, 0.0), (2.0, 1.0), (4.0, 3.0)];
-        assert_eq!(interpolate(&pts, -1.0), 0.0);
-        assert_eq!(interpolate(&pts, 1.0), 0.5);
-        assert_eq!(interpolate(&pts, 3.0), 2.0);
-        assert_eq!(interpolate(&pts, 9.0), 3.0);
-    }
-
-    #[test]
-    fn quattro_sigmas_grow_with_the_capture_iso() {
-        // ISO 100 と 200 は掛けない。CaptureISO が少し下がっても ISO 400 は掛かる
-        assert_eq!(quattro_sigmas(&quattro_at_iso(100.0)), None);
-        assert_eq!(quattro_sigmas(&quattro_at_iso(200.0)), None);
-        let at = |iso: f64| quattro_sigmas(&quattro_at_iso(iso)).unwrap();
-        let close =
-            |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-2 && (a.1 - b.1).abs() < 1e-2;
-        assert!(close(at(399.9), (0.5, 0.5)));
-        assert!(close(at(799.9), (0.75, 1.0)));
-        assert!(close(at(1599.9), (1.0, 1.5)));
-        assert!(close(at(3199.9), (2.0, 3.0)));
-        // ISO の上限の先は 3200 の値のまま
-        assert!(close(at(12800.0), (2.0, 3.0)));
-        // CaptureISO が無い・壊れている
-        assert_eq!(quattro_sigmas(&with_camera(83.0)), None);
-        assert_eq!(quattro_sigmas(&quattro_at_iso(f64::NAN)), None);
-        assert_eq!(quattro_sigmas(&quattro_at_iso(0.0)), None);
-    }
-
-    #[test]
-    fn denoise_raw_quattro_leaves_low_iso_and_other_cameras_untouched() {
-        let mut r = noisy_quattro(48, 24, 2000, 60);
-        let before = quattro_layers(&r);
-        denoise_raw(&mut r, &quattro_at_iso(100.0));
-        assert_eq!(quattro_layers(&r), before);
-        // dp0 以外(sd Quattro 40、dp1 Quattro 80)は ISO が高くても掛けない
-        for camera in [40.0, 80.0] {
-            let mut c = quattro_at_iso(3200.0);
-            c.0.retain(|e| e.name != "CAMERAID");
-            c.0.push(m("CAMERAID", &[camera]));
-            denoise_raw(&mut r, &c);
-            assert_eq!(quattro_layers(&r), before, "CAMERAID {camera}");
-        }
-    }
-
     #[test]
     fn denoise_raw_quattro_cuts_noise_in_both_layers_and_skips_the_unused_channel() {
         let mut r = noisy_quattro(64, 48, 2000, 60);
         let (low0, top0) = quattro_layers(&r);
-        denoise_raw(&mut r, &quattro_at_iso(3200.0));
+        denoise_raw(&mut r, &quattro_at_iso(3200.0, 400.0));
         let (low, top) = quattro_layers(&r);
-        assert!(spread(top.iter().copied()) < spread(top0.iter().copied()) / 3.0);
+        // 有効領域(x >= 16)の上層だけを見る
+        let active = |v: &[u16]| {
+            v.iter()
+                .enumerate()
+                .filter(|(i, _)| i % 64 >= 16)
+                .map(|(_, &x)| x)
+                .collect::<Vec<_>>()
+        };
+        assert!(spread(active(&top).into_iter()) < spread(active(&top0).into_iter()) / 2.0);
         for c in 0..2 {
+            // 低解像度層の有効領域は x >= 8
+            let act = |v: &[u16]| {
+                v.iter()
+                    .skip(c)
+                    .step_by(3)
+                    .enumerate()
+                    .filter(|(i, _)| i % 32 >= 8)
+                    .map(|(_, &x)| x)
+                    .collect::<Vec<_>>()
+            };
             assert!(
-                spread(low.iter().skip(c).step_by(3).copied())
-                    < spread(low0.iter().skip(c).step_by(3).copied()) / 3.0,
+                spread(act(&low).into_iter()) < spread(act(&low0).into_iter()) / 2.0,
                 "low ch{c}"
             );
         }
@@ -1821,7 +1973,6 @@ mod tests {
 
     #[test]
     fn denoise_raw_quattro_keeps_the_dark_shield_of_both_layers() {
-        // 上層の x < 16(低解像度層の x < 8)は遮光領域
         let (tw, th) = (64, 48);
         let mut r = noisy_quattro(tw, th, 2000, 60);
         let Raw::Quattro { low, top, .. } = &mut r else {
@@ -1838,12 +1989,7 @@ mod tests {
                 low[(y * (tw / 2) + x) * 3 + 1] = 9;
             }
         }
-        let mut c = quattro_at_iso(3200.0);
-        c.0.push(m(
-            "ActiveImageArea",
-            &[16.0, 0.0, (tw - 1) as f64, (th - 1) as f64],
-        ));
-        denoise_raw(&mut r, &c);
+        denoise_raw(&mut r, &quattro_at_iso(3200.0, 400.0));
         let (low, top) = quattro_layers(&r);
         assert!((0..th).all(|y| (0..16).all(|x| top[y * tw + x] == 9)));
         assert!((0..th / 2).all(|y| (0..8)
@@ -1854,14 +2000,61 @@ mod tests {
     }
 
     #[test]
-    fn blur_plane_survives_tiny_and_edge_areas() {
+    fn denoise_raw_quattro_only_touches_the_dp0() {
+        let mut r = noisy_quattro(64, 48, 2000, 60);
+        let before = samples(&r);
+        // dp0 以外(sd Quattro 40、dp1 Quattro 80)と、ISO が分からないとき
+        for camera in [40.0, 80.0] {
+            let mut c = quattro_at_iso(3200.0, 400.0);
+            c.0.retain(|e| e.name != "CAMERAID");
+            c.0.push(m("CAMERAID", &[camera]));
+            denoise_raw(&mut r, &c);
+            assert!(samples(&r) == before, "CAMERAID {camera}");
+        }
+        let mut c = quattro_at_iso(3200.0, 400.0);
+        c.0.retain(|e| e.name != "CaptureISO");
+        denoise_raw(&mut r, &c);
+        assert!(samples(&r) == before);
+        // Merrill の生データに dp0 のカメラ ID は何もしない
+        let mut mer = noisy_merrill(32, 32, 100, 10);
+        let mb = samples(&mer);
+        denoise_raw(&mut mer, &quattro_at_iso(3200.0, 400.0));
+        assert!(samples(&mer) == mb);
+    }
+
+    #[test]
+    fn bilateral_plane_survives_tiny_and_edge_areas() {
+        let noise = Noise::new((0.0, 1.0), 0.03);
+        let params = Denoise {
+            sigma_s: 3.0,
+            k: 5.0,
+        };
         let mut d = vec![100u16; 16];
-        blur_plane(&mut d, (4, 1, 0), (0, 0, 1, 1), 3.0);
-        blur_plane(&mut d, (4, 1, 0), (3, 3, 1, 1), 3.0);
-        blur_plane(&mut d, (4, 1, 0), (0, 0, 0, 4), 1.0);
+        bilateral_plane(&mut d, (4, 1, 0), (0, 0, 1, 1), noise, params);
+        bilateral_plane(&mut d, (4, 1, 0), (3, 3, 1, 1), noise, params);
+        bilateral_plane(&mut d, (4, 1, 0), (0, 0, 0, 4), noise, params);
         // 領域が配列からはみ出す場合は何もしない
-        blur_plane(&mut d, (4, 1, 0), (2, 2, 4, 4), 1.0);
+        bilateral_plane(&mut d, (4, 1, 0), (2, 2, 4, 4), noise, params);
         assert!(d.iter().all(|&v| v == 100));
+    }
+
+    #[test]
+    fn dark_levels_report_the_shield_mean_and_spread() {
+        let mut c = with_camera(77.0);
+        c.0.retain(|e| e.name != "DarkShieldTop");
+        c.0.push(m("DarkShieldTop", &[0.0, 0.0, 3.0, 0.0]));
+        let mut rgb = vec![500u16; 4 * 2 * 3];
+        for (i, v) in [30u16, 32, 30, 32].iter().enumerate() {
+            rgb[i * 3] = *v;
+        }
+        let raw = Raw::Merrill {
+            width: 4,
+            height: 2,
+            rgb,
+        };
+        let d = dark_levels(&raw, &c).unwrap();
+        assert!((d[0].0 - 31.0).abs() < 1e-9 && (d[0].1 - 1.0).abs() < 1e-9);
+        assert_eq!(black_levels(&raw, &c).unwrap()[0], d[0].0);
     }
 
     #[test]
